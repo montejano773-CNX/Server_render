@@ -4,6 +4,8 @@ import cors from "cors";
 import { requireAuth } from "./middlewares/auth.js";
 import { supabaseAdmin } from "./supabaseAdmin.js";
 
+const app = express();
+
 const allowedOrigins = (process.env.CORS_ORIGIN || "")
   .split(",")
   .map((s) => s.trim())
@@ -12,26 +14,26 @@ const allowedOrigins = (process.env.CORS_ORIGIN || "")
 app.use(
   cors({
     origin: (origin, callback) => {
-      // permite ferramentas como curl/postman
-      if (!origin) return callback(null, true);
+      if (!origin) return callback(null, true); // postman/curl
 
-      if (allowedOrigins.length === 0) {
-        return callback(null, true);
-      }
+      // se não definiu CORS_ORIGIN, libera tudo
+      if (allowedOrigins.length === 0) return callback(null, true);
 
-      if (allowedOrigins.includes(origin)) {
-        return callback(null, true);
-      }
+      // libera se estiver na lista
+      if (allowedOrigins.includes(origin)) return callback(null, true);
+
+      // DEBUG útil no Render:
+      console.log("❌ CORS BLOQUEADO:", origin, "permitidos:", allowedOrigins);
 
       return callback(new Error(`CORS bloqueado para: ${origin}`));
     },
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
-    credentials: false, // 👈 ESSENCIAL
+    credentials: false,
   }),
 );
 
-app.options("*", cors());
+app.use(express.json());
 
 // ==================================================
 // HEALTH
