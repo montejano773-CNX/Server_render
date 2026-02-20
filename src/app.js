@@ -4,16 +4,34 @@ import cors from "cors";
 import { requireAuth } from "./middlewares/auth.js";
 import { supabaseAdmin } from "./supabaseAdmin.js";
 
-const app = express();
+const allowedOrigins = (process.env.CORS_ORIGIN || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 
 app.use(
   cors({
-    origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(",") : "*",
-    credentials: true,
+    origin: (origin, callback) => {
+      // permite ferramentas como curl/postman
+      if (!origin) return callback(null, true);
+
+      if (allowedOrigins.length === 0) {
+        return callback(null, true);
+      }
+
+      if (allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+
+      return callback(new Error(`CORS bloqueado para: ${origin}`));
+    },
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+    credentials: false, // 👈 ESSENCIAL
   }),
 );
 
-app.use(express.json());
+app.options("*", cors());
 
 // ==================================================
 // HEALTH
@@ -81,10 +99,8 @@ app.post("/funcionarios", requireAuth, async (req, res) => {
       nome: (req.body?.nome || "").trim(),
       apelido: req.body?.apelido?.trim?.() || null,
       funcao: req.body?.funcao?.trim?.() || null,
-      cpf: req.body?.cpf?.trim?.() || null,
-      situacao: req.body?.situacao || "ativo",
-
-      // campos extras do seu form (só funcionam se existirem na tabela)
+      cpf: req.body?.cpf ? String(req.body.cpf).replace(/\D/g, "") : null,
+      situacao: (req.body?.situacao || "ativo").toLowerCase(),
       razao_social: req.body?.razao_social?.trim?.() || null,
       titular_conta: req.body?.titular_conta?.trim?.() || null,
       banco: req.body?.banco?.trim?.() || null,
@@ -108,9 +124,7 @@ app.post("/funcionarios", requireAuth, async (req, res) => {
 
     if (error) {
       console.error("POST /funcionarios error:", error);
-      return res
-        .status(500)
-        .json({ ok: false, error: "Falha ao salvar funcionário" });
+      return res.status(500).json({ ok: false, error: error.message });
     }
 
     return res.status(201).json({ ok: true, data });
@@ -211,12 +225,10 @@ app.post("/users", requireAuth, async (req, res) => {
     if (!email)
       return res.status(400).json({ ok: false, error: "email é obrigatório" });
     if (!senha || senha.length < 6) {
-      return res
-        .status(400)
-        .json({
-          ok: false,
-          error: "senha precisa ter pelo menos 6 caracteres",
-        });
+      return res.status(400).json({
+        ok: false,
+        error: "senha precisa ter pelo menos 6 caracteres",
+      });
     }
 
     // 1) cria no Auth
