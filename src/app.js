@@ -6,6 +6,9 @@ import { supabaseAdmin } from "./supabaseAdmin.js";
 
 const app = express();
 
+// ==================================================
+// CORS (do jeito que funcionou pra você)
+// ==================================================
 const allowedOrigins = (process.env.CORS_ORIGIN || "")
   .split(",")
   .map((s) => s.trim())
@@ -14,7 +17,8 @@ const allowedOrigins = (process.env.CORS_ORIGIN || "")
 app.use(
   cors({
     origin: (origin, callback) => {
-      if (!origin) return callback(null, true); // postman/curl
+      // permite ferramentas como curl/postman
+      if (!origin) return callback(null, true);
 
       // se não definiu CORS_ORIGIN, libera tudo
       if (allowedOrigins.length === 0) return callback(null, true);
@@ -29,11 +33,39 @@ app.use(
     },
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
-    credentials: false,
+    credentials: false, // ESSENCIAL (você está usando Bearer token)
   }),
 );
 
+// Preflight
+app.options("*", cors());
+
 app.use(express.json());
+
+// ==================================================
+// Helpers
+// ==================================================
+function isUuid(v) {
+  if (!v) return false;
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    String(v).trim(),
+  );
+}
+
+function normSituacao(v, fallback = "ativo") {
+  const s = String(v || fallback)
+    .toLowerCase()
+    .trim();
+  return s === "inativo" ? "inativo" : "ativo";
+}
+
+function pick(obj, keys) {
+  const out = {};
+  for (const k of keys) {
+    if (Object.prototype.hasOwnProperty.call(obj, k)) out[k] = obj[k];
+  }
+  return out;
+}
 
 // ==================================================
 // HEALTH
@@ -71,9 +103,276 @@ app.get("/me", requireAuth, async (req, res) => {
 });
 
 // ==================================================
-// FUNCIONÁRIOS
+// USUÁRIOS (CRUD)
+// Tabela: public.cadastro_user
+// ==================================================
+
+// LISTAR (para dropdown e tela editar/excluir)
+app.get("/usuarios", requireAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from("cadastro_user")
+      .select("id, nome, email, nivel_acesso, situacao")
+      .order("nome", { ascending: true });
+
+    if (error) {
+      console.error("GET /usuarios error:", error);
+      return res
+        .status(500)
+        .json({ ok: false, error: "Falha ao listar usuários" });
+    }
+
+    return res.json({ ok: true, data: data || [] });
+  } catch (err) {
+    console.error("GET /usuarios exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
+// BUSCAR POR ID
+app.get("/usuarios/:id", requireAuth, async (req, res) => {
+  try {
+    const id = req.params.id;
+
+    const { data, error } = await supabaseAdmin
+      .from("cadastro_user")
+      .select("id, nome, email, nivel_acesso, situacao, observacao")
+      .eq("id", id)
+      .single();
+
+    if (error) {
+      console.error("GET /usuarios/:id error:", error);
+      return res
+        .status(404)
+        .json({ ok: false, error: "Usuário não encontrado" });
+    }
+
+    return res.json({ ok: true, data });
+  } catch (err) {
+    console.error("GET /usuarios/:id exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
+// CRIAR (cria no Supabase Auth + grava em cadastro_user)
+app.post("/usuarios", requireAuth, async (req, res) => {
+  try {
+    const nome = (req.body?.nome || "").trim();
+    const email = (req.body?.email || "").trim();
+    const senha = (req.body?.senha || "").trim();
+
+    // você disse que "nível" a gente vê depois,
+    // mas como seu banco tem a coluna, deixo opcional:
+    const nivel_acesso = (req.body?.nivel_acesso || "encarregado").trim();
+    const situacao = normSituacao(req.body?.situacao, "ativo");
+    const observacao = req.body?.observacao
+      ? String(req.body.observacao).trim()
+      : null;
+
+    if (!nome)
+      return res.status(400).json({ ok: false, error: "nome é obrigatório" });
+    if (!email)
+      return res.status(400).json({ ok: false, error: "email é obrigatório" });
+
+    if (!senha || senha.length < 6) {
+      return res.status(400).json({
+        ok: false,
+        error: "senha precisa ter pelo menos 6 caracteres",
+      });
+    }
+
+    // 1) cria no Auth
+    const { data: created, error: createErr } =
+      await supabaseAdmin.auth.admin.createUser({
+        email,
+        password: senha,
+        email_confirm: true,
+      });
+
+    if (createErr) {
+      console.error("POST /usuarios createUser error:", createErr);
+      return res.status(409).json({
+        ok: false,
+        error: "Já existe um usuário com esse e-mail",
+      });
+    }
+
+    const newAuthId = created?.user?.id;
+    if (!newAuthId) {
+      return res
+        .status(500)
+        .json({ ok: false, error: "Falha ao criar usuário no Auth" });
+    }
+
+    // 2) grava no cadastro_user
+    const row = {
+      id: newAuthId, // mesmo UUID do Auth
+      nome,
+      email,
+      nivel_acesso,
+      situacao,
+      observacao,
+    };
+
+    const { error: insertErr } = await supabaseAdmin
+      .from("cadastro_user")
+      .insert(row);
+
+    if (insertErr) {
+      console.error("POST /usuarios insert cadastro_user error:", insertErr);
+
+      // rollback (remove do auth)
+      try {
+        await supabaseAdmin.auth.admin.deleteUser(newAuthId);
+      } catch (e) {
+        console.warn("Rollback deleteUser failed:", e);
+      }
+
+      return res
+        .status(500)
+        .json({ ok: false, error: "Falha ao salvar cadastro_user" });
+    }
+
+    return res.status(201).json({ ok: true, data: { id: newAuthId } });
+  } catch (err) {
+    console.error("POST /usuarios exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
+// EDITAR (PATCH)
+// - atualiza cadastro_user
+// - opcional: se vier email/senha, tenta atualizar no Auth também
+app.patch("/usuarios/:id", requireAuth, async (req, res) => {
+  try {
+    const id = req.params.id;
+
+    // campos que existem no cadastro_user (ajuste se seu banco tiver outros)
+    const patch = {
+      ...(req.body?.nome !== undefined
+        ? { nome: String(req.body.nome).trim() }
+        : {}),
+      ...(req.body?.nivel_acesso !== undefined
+        ? { nivel_acesso: String(req.body.nivel_acesso).trim() }
+        : {}),
+      ...(req.body?.situacao !== undefined
+        ? { situacao: normSituacao(req.body.situacao) }
+        : {}),
+      ...(req.body?.observacao !== undefined
+        ? {
+            observacao: req.body.observacao
+              ? String(req.body.observacao).trim()
+              : null,
+          }
+        : {}),
+    };
+
+    // Email no cadastro_user (e no Auth) se vier
+    const novoEmail =
+      req.body?.email !== undefined
+        ? String(req.body.email || "").trim()
+        : null;
+
+    // Senha no Auth se vier
+    const novaSenha =
+      req.body?.senha !== undefined
+        ? String(req.body.senha || "").trim()
+        : null;
+
+    if (novoEmail) patch.email = novoEmail;
+
+    // 1) atualiza cadastro_user
+    if (Object.keys(patch).length > 0) {
+      const { error: upErr } = await supabaseAdmin
+        .from("cadastro_user")
+        .update(patch)
+        .eq("id", id);
+      if (upErr) {
+        console.error("PATCH /usuarios/:id update cadastro_user error:", upErr);
+        return res
+          .status(500)
+          .json({ ok: false, error: "Falha ao atualizar usuário" });
+      }
+    }
+
+    // 2) atualiza Auth (se precisar)
+    if (novoEmail || novaSenha) {
+      const payloadAuth = {};
+      if (novoEmail) payloadAuth.email = novoEmail;
+      if (novaSenha) {
+        if (novaSenha.length < 6) {
+          return res.status(400).json({
+            ok: false,
+            error: "senha precisa ter pelo menos 6 caracteres",
+          });
+        }
+        payloadAuth.password = novaSenha;
+      }
+
+      const { error: authErr } = await supabaseAdmin.auth.admin.updateUserById(
+        id,
+        payloadAuth,
+      );
+      if (authErr) {
+        console.error("PATCH /usuarios/:id update Auth error:", authErr);
+        // não falha tudo, mas avisa
+        return res.status(200).json({
+          ok: true,
+          warning: "Atualizou cadastro_user, mas falhou ao atualizar Auth",
+        });
+      }
+    }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("PATCH /usuarios/:id exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
+// DELETAR
+// - remove primeiro do cadastro_user
+// - depois remove do Auth
+app.delete("/usuarios/:id", requireAuth, async (req, res) => {
+  try {
+    const id = req.params.id;
+
+    const { error: delRowErr } = await supabaseAdmin
+      .from("cadastro_user")
+      .delete()
+      .eq("id", id);
+    if (delRowErr) {
+      console.error(
+        "DELETE /usuarios/:id delete cadastro_user error:",
+        delRowErr,
+      );
+      return res
+        .status(500)
+        .json({ ok: false, error: "Falha ao deletar cadastro_user" });
+    }
+
+    const { error: delAuthErr } = await supabaseAdmin.auth.admin.deleteUser(id);
+    if (delAuthErr) {
+      console.error("DELETE /usuarios/:id delete Auth error:", delAuthErr);
+      // não desfaz, mas avisa
+      return res.status(200).json({
+        ok: true,
+        warning: "Deletou cadastro_user, mas falhou ao deletar no Auth",
+      });
+    }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("DELETE /usuarios/:id exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
+// ==================================================
+// FUNCIONÁRIOS (CRUD)
 // Tabela: public.cadastro_func
 // ==================================================
+
 app.get("/funcionarios", requireAuth, async (req, res) => {
   try {
     const { data, error } = await supabaseAdmin
@@ -95,6 +394,30 @@ app.get("/funcionarios", requireAuth, async (req, res) => {
   }
 });
 
+app.get("/funcionarios/:id", requireAuth, async (req, res) => {
+  try {
+    const id = req.params.id;
+
+    const { data, error } = await supabaseAdmin
+      .from("cadastro_func")
+      .select("*")
+      .eq("id", id)
+      .single();
+
+    if (error) {
+      console.error("GET /funcionarios/:id error:", error);
+      return res
+        .status(404)
+        .json({ ok: false, error: "Funcionário não encontrado" });
+    }
+
+    return res.json({ ok: true, data });
+  } catch (err) {
+    console.error("GET /funcionarios/:id exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
 app.post("/funcionarios", requireAuth, async (req, res) => {
   try {
     const payload = {
@@ -102,7 +425,7 @@ app.post("/funcionarios", requireAuth, async (req, res) => {
       apelido: req.body?.apelido?.trim?.() || null,
       funcao: req.body?.funcao?.trim?.() || null,
       cpf: req.body?.cpf ? String(req.body.cpf).replace(/\D/g, "") : null,
-      situacao: (req.body?.situacao || "ativo").toLowerCase(),
+      situacao: normSituacao(req.body?.situacao, "ativo"),
       razao_social: req.body?.razao_social?.trim?.() || null,
       titular_conta: req.body?.titular_conta?.trim?.() || null,
       banco: req.body?.banco?.trim?.() || null,
@@ -136,12 +459,117 @@ app.post("/funcionarios", requireAuth, async (req, res) => {
   }
 });
 
+app.patch("/funcionarios/:id", requireAuth, async (req, res) => {
+  try {
+    const id = req.params.id;
+
+    const patch = {
+      ...(req.body?.nome !== undefined
+        ? { nome: String(req.body.nome).trim() }
+        : {}),
+      ...(req.body?.apelido !== undefined
+        ? { apelido: req.body.apelido ? String(req.body.apelido).trim() : null }
+        : {}),
+      ...(req.body?.funcao !== undefined
+        ? { funcao: req.body.funcao ? String(req.body.funcao).trim() : null }
+        : {}),
+      ...(req.body?.cpf !== undefined
+        ? { cpf: req.body.cpf ? String(req.body.cpf).replace(/\D/g, "") : null }
+        : {}),
+      ...(req.body?.situacao !== undefined
+        ? { situacao: normSituacao(req.body.situacao) }
+        : {}),
+      ...(req.body?.razao_social !== undefined
+        ? {
+            razao_social: req.body.razao_social
+              ? String(req.body.razao_social).trim()
+              : null,
+          }
+        : {}),
+      ...(req.body?.titular_conta !== undefined
+        ? {
+            titular_conta: req.body.titular_conta
+              ? String(req.body.titular_conta).trim()
+              : null,
+          }
+        : {}),
+      ...(req.body?.banco !== undefined
+        ? { banco: req.body.banco ? String(req.body.banco).trim() : null }
+        : {}),
+      ...(req.body?.agencia !== undefined
+        ? { agencia: req.body.agencia ? String(req.body.agencia).trim() : null }
+        : {}),
+      ...(req.body?.conta !== undefined
+        ? { conta: req.body.conta ? String(req.body.conta).trim() : null }
+        : {}),
+      ...(req.body?.chave_pix !== undefined
+        ? {
+            chave_pix: req.body.chave_pix
+              ? String(req.body.chave_pix).trim()
+              : null,
+          }
+        : {}),
+      ...(req.body?.observaco !== undefined
+        ? {
+            observaco: req.body.observaco
+              ? String(req.body.observaco).trim()
+              : null,
+          }
+        : {}),
+    };
+
+    if (Object.keys(patch).length === 0) {
+      return res.status(400).json({ ok: false, error: "Nada para atualizar" });
+    }
+
+    const { error } = await supabaseAdmin
+      .from("cadastro_func")
+      .update(patch)
+      .eq("id", id);
+
+    if (error) {
+      console.error("PATCH /funcionarios/:id error:", error);
+      return res
+        .status(500)
+        .json({ ok: false, error: "Falha ao atualizar funcionário" });
+    }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("PATCH /funcionarios/:id exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
+app.delete("/funcionarios/:id", requireAuth, async (req, res) => {
+  try {
+    const id = req.params.id;
+
+    const { error } = await supabaseAdmin
+      .from("cadastro_func")
+      .delete()
+      .eq("id", id);
+
+    if (error) {
+      console.error("DELETE /funcionarios/:id error:", error);
+      return res
+        .status(500)
+        .json({ ok: false, error: "Falha ao deletar funcionário" });
+    }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("DELETE /funcionarios/:id exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
 // ==================================================
-// OBRAS
+// OBRAS (CRUD)
 // Tabela: public.cadastro_obra
-// Regra: usuário só vê as obras vinculadas a ele
-// 👉 filtro por responsavel == req.authUser.id
 // ==================================================
+
+// MINHAS OBRAS (consulta do usuário logado)
 app.get("/obras", requireAuth, async (req, res) => {
   try {
     const authId = req.authUser.id;
@@ -166,6 +594,77 @@ app.get("/obras", requireAuth, async (req, res) => {
   }
 });
 
+// TODAS AS OBRAS (para tela admin)
+app.get("/obras/todas", requireAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from("cadastro_obra")
+      .select("id, nome, cidade, uf, situacao, responsavel")
+      .order("nome", { ascending: true });
+
+    if (error) {
+      console.error("GET /obras/todas error:", error);
+      return res
+        .status(500)
+        .json({ ok: false, error: "Falha ao listar obras (todas)" });
+    }
+
+    return res.json({ ok: true, data: data || [] });
+  } catch (err) {
+    console.error("GET /obras/todas exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
+// BUSCAR OBRA POR ID (minha obra)
+app.get("/obras/:id", requireAuth, async (req, res) => {
+  try {
+    const authId = req.authUser.id;
+    const id = req.params.id;
+
+    const { data, error } = await supabaseAdmin
+      .from("cadastro_obra")
+      .select("*")
+      .eq("id", id)
+      .eq("responsavel", authId)
+      .single();
+
+    if (error) {
+      console.error("GET /obras/:id error:", error);
+      return res.status(404).json({ ok: false, error: "Obra não encontrada" });
+    }
+
+    return res.json({ ok: true, data });
+  } catch (err) {
+    console.error("GET /obras/:id exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
+// BUSCAR OBRA POR ID (admin / sem filtro)
+app.get("/obras/admin/:id", requireAuth, async (req, res) => {
+  try {
+    const id = req.params.id;
+
+    const { data, error } = await supabaseAdmin
+      .from("cadastro_obra")
+      .select("*")
+      .eq("id", id)
+      .single();
+
+    if (error) {
+      console.error("GET /obras/admin/:id error:", error);
+      return res.status(404).json({ ok: false, error: "Obra não encontrada" });
+    }
+
+    return res.json({ ok: true, data });
+  } catch (err) {
+    console.error("GET /obras/admin/:id exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
+// CRIAR OBRA (normal: responsavel = authId)
 app.post("/obras", requireAuth, async (req, res) => {
   try {
     const authId = req.authUser.id;
@@ -174,12 +673,8 @@ app.post("/obras", requireAuth, async (req, res) => {
       nome: (req.body?.nome || "").trim(),
       cidade: req.body?.cidade?.trim?.() || null,
       uf: req.body?.uf || null,
-      situacao: req.body?.situacao || "ativo",
-
-      // ✅ trava o vínculo pro filtro “minhas obras” funcionar sempre
-      responsavel: authId,
-
-      // campos extras do form (só funcionam se existirem na tabela)
+      situacao: normSituacao(req.body?.situacao, "ativo"),
+      responsavel: authId, // trava vínculo
       endereco: req.body?.endereco?.trim?.() || null,
       observacao: req.body?.observacao?.trim?.() || null,
     };
@@ -208,136 +703,228 @@ app.post("/obras", requireAuth, async (req, res) => {
   }
 });
 
-// ==================================================
-// OBRAS (TODAS) - para tela de cadastro/edição (admin)
-// ATENÇÃO: aqui NÃO filtra por responsavel
-// ==================================================
-app.get("/obras/todas", requireAuth, async (req, res) => {
+// CRIAR OBRA (admin: permite definir responsavel via body.responsavel)
+// - use isso na tela admin onde você seleciona o responsável no dropdown
+app.post("/obras/admin", requireAuth, async (req, res) => {
   try {
-    const { data, error } = await supabaseAdmin
-      .from("cadastro_obra")
-      .select("id, nome, cidade, uf, situacao, responsavel")
-      .order("nome", { ascending: true });
+    const responsavel = req.body?.responsavel;
 
-    if (error) {
-      console.error("GET /obras/todas error:", error);
-      return res
-        .status(500)
-        .json({ ok: false, error: "Falha ao listar obras (todas)" });
-    }
-
-    return res.json({ ok: true, data: data || [] });
-  } catch (err) {
-    console.error("GET /obras/todas exception:", err);
-    return res.status(500).json({ ok: false, error: "Erro interno" });
-  }
-});
-// ==================================================
-// USUÁRIOS (LISTAR) - para dropdown "Responsável pela obra"
-// Tabela: public.cadastro_user
-// ==================================================
-app.get("/usuarios", requireAuth, async (req, res) => {
-  try {
-    const { data, error } = await supabaseAdmin
-      .from("cadastro_user")
-      .select("id, nome, email, nivel_acesso, situacao")
-      .order("nome", { ascending: true });
-
-    if (error) {
-      console.error("GET /usuarios error:", error);
-      return res
-        .status(500)
-        .json({ ok: false, error: "Falha ao listar usuários" });
-    }
-
-    return res.json({ ok: true, data: data || [] });
-  } catch (err) {
-    console.error("GET /usuarios exception:", err);
-    return res.status(500).json({ ok: false, error: "Erro interno" });
-  }
-});
-// ==================================================
-// USERS (criar usuário via API)
-// - cria usuário no Supabase Auth (admin)
-// - grava em public.cadastro_user com id = user.id (Auth UUID)
-// ==================================================
-app.post("/users", requireAuth, async (req, res) => {
-  try {
-    const nome = (req.body?.nome || "").trim();
-    const email = (req.body?.email || "").trim();
-    const senha = (req.body?.senha || "").trim();
-    const nivel_acesso = req.body?.nivel_acesso || "encarregado";
-    const situacao = req.body?.situacao || "ativo";
-    const observacao = req.body?.observacao || null;
-
-    if (!nome)
-      return res.status(400).json({ ok: false, error: "nome é obrigatório" });
-    if (!email)
-      return res.status(400).json({ ok: false, error: "email é obrigatório" });
-    if (!senha || senha.length < 6) {
+    if (!isUuid(responsavel)) {
       return res.status(400).json({
         ok: false,
-        error: "senha precisa ter pelo menos 6 caracteres",
+        error: "Responsável inválido (precisa ser auth_user_id UUID)",
       });
     }
 
-    // 1) cria no Auth
-    const { data: created, error: createErr } =
-      await supabaseAdmin.auth.admin.createUser({
-        email,
-        password: senha,
-        email_confirm: true,
-      });
-
-    if (createErr) {
-      console.error("POST /users createUser error:", createErr);
-      return res
-        .status(409)
-        .json({ ok: false, error: "Já existe um usuário com esse e-mail" });
-    }
-
-    const newAuthId = created?.user?.id;
-    if (!newAuthId) {
-      return res
-        .status(500)
-        .json({ ok: false, error: "Falha ao criar usuário no Auth" });
-    }
-
-    // 2) grava no cadastro_user
-    const row = {
-      id: newAuthId, // ✅ mesmo UUID do Auth
-      nome,
-      email,
-      nivel_acesso,
-      situacao,
-      observacao,
+    const payload = {
+      nome: (req.body?.nome || "").trim(),
+      cidade: req.body?.cidade?.trim?.() || null,
+      uf: req.body?.uf || null,
+      situacao: normSituacao(req.body?.situacao, "ativo"),
+      responsavel, // vem do dropdown (auth_user_id)
+      endereco: req.body?.endereco?.trim?.() || null,
+      observacao: req.body?.observacao?.trim?.() || null,
     };
 
-    const { error: insertErr } = await supabaseAdmin
-      .from("cadastro_user")
-      .insert(row);
-
-    if (insertErr) {
-      console.error("POST /users insert cadastro_user error:", insertErr);
-
-      // rollback (remove do auth)
-      try {
-        await supabaseAdmin.auth.admin.deleteUser(newAuthId);
-      } catch (e) {
-        console.warn("Rollback deleteUser failed:", e);
-      }
-
+    if (!payload.nome) {
       return res
-        .status(500)
-        .json({ ok: false, error: "Falha ao salvar cadastro_user" });
+        .status(400)
+        .json({ ok: false, error: "Informe o nome da obra" });
     }
 
-    return res.status(201).json({ ok: true, data: { id: newAuthId } });
+    const { data, error } = await supabaseAdmin
+      .from("cadastro_obra")
+      .insert(payload)
+      .select("id")
+      .single();
+
+    if (error) {
+      console.error("POST /obras/admin error:", error);
+      return res.status(500).json({ ok: false, error: "Falha ao salvar obra" });
+    }
+
+    return res.status(201).json({ ok: true, data });
   } catch (err) {
-    console.error("POST /users exception:", err);
+    console.error("POST /obras/admin exception:", err);
     return res.status(500).json({ ok: false, error: "Erro interno" });
   }
 });
 
+// EDITAR OBRA (minha obra)
+app.patch("/obras/:id", requireAuth, async (req, res) => {
+  try {
+    const authId = req.authUser.id;
+    const id = req.params.id;
+
+    const patch = {
+      ...(req.body?.nome !== undefined
+        ? { nome: String(req.body.nome).trim() }
+        : {}),
+      ...(req.body?.cidade !== undefined
+        ? { cidade: req.body.cidade ? String(req.body.cidade).trim() : null }
+        : {}),
+      ...(req.body?.uf !== undefined ? { uf: req.body.uf || null } : {}),
+      ...(req.body?.situacao !== undefined
+        ? { situacao: normSituacao(req.body.situacao) }
+        : {}),
+      ...(req.body?.endereco !== undefined
+        ? {
+            endereco: req.body.endereco
+              ? String(req.body.endereco).trim()
+              : null,
+          }
+        : {}),
+      ...(req.body?.observacao !== undefined
+        ? {
+            observacao: req.body.observacao
+              ? String(req.body.observacao).trim()
+              : null,
+          }
+        : {}),
+    };
+
+    if (Object.keys(patch).length === 0) {
+      return res.status(400).json({ ok: false, error: "Nada para atualizar" });
+    }
+
+    const { error } = await supabaseAdmin
+      .from("cadastro_obra")
+      .update(patch)
+      .eq("id", id)
+      .eq("responsavel", authId);
+
+    if (error) {
+      console.error("PATCH /obras/:id error:", error);
+      return res
+        .status(500)
+        .json({ ok: false, error: "Falha ao atualizar obra" });
+    }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("PATCH /obras/:id exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
+// EDITAR OBRA (admin / sem filtro)
+// - permite inclusive trocar o responsavel (UUID) se vier no body.responsavel
+app.patch("/obras/admin/:id", requireAuth, async (req, res) => {
+  try {
+    const id = req.params.id;
+
+    const patch = {
+      ...(req.body?.nome !== undefined
+        ? { nome: String(req.body.nome).trim() }
+        : {}),
+      ...(req.body?.cidade !== undefined
+        ? { cidade: req.body.cidade ? String(req.body.cidade).trim() : null }
+        : {}),
+      ...(req.body?.uf !== undefined ? { uf: req.body.uf || null } : {}),
+      ...(req.body?.situacao !== undefined
+        ? { situacao: normSituacao(req.body.situacao) }
+        : {}),
+      ...(req.body?.endereco !== undefined
+        ? {
+            endereco: req.body.endereco
+              ? String(req.body.endereco).trim()
+              : null,
+          }
+        : {}),
+      ...(req.body?.observacao !== undefined
+        ? {
+            observacao: req.body.observacao
+              ? String(req.body.observacao).trim()
+              : null,
+          }
+        : {}),
+    };
+
+    if (req.body?.responsavel !== undefined) {
+      if (!isUuid(req.body.responsavel)) {
+        return res.status(400).json({
+          ok: false,
+          error: "Responsável inválido (precisa ser auth_user_id UUID)",
+        });
+      }
+      patch.responsavel = req.body.responsavel;
+    }
+
+    if (Object.keys(patch).length === 0) {
+      return res.status(400).json({ ok: false, error: "Nada para atualizar" });
+    }
+
+    const { error } = await supabaseAdmin
+      .from("cadastro_obra")
+      .update(patch)
+      .eq("id", id);
+
+    if (error) {
+      console.error("PATCH /obras/admin/:id error:", error);
+      return res
+        .status(500)
+        .json({ ok: false, error: "Falha ao atualizar obra (admin)" });
+    }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("PATCH /obras/admin/:id exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
+// DELETAR OBRA (minha obra)
+app.delete("/obras/:id", requireAuth, async (req, res) => {
+  try {
+    const authId = req.authUser.id;
+    const id = req.params.id;
+
+    const { error } = await supabaseAdmin
+      .from("cadastro_obra")
+      .delete()
+      .eq("id", id)
+      .eq("responsavel", authId);
+
+    if (error) {
+      console.error("DELETE /obras/:id error:", error);
+      return res
+        .status(500)
+        .json({ ok: false, error: "Falha ao deletar obra" });
+    }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("DELETE /obras/:id exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
+// DELETAR OBRA (admin / sem filtro)
+app.delete("/obras/admin/:id", requireAuth, async (req, res) => {
+  try {
+    const id = req.params.id;
+
+    const { error } = await supabaseAdmin
+      .from("cadastro_obra")
+      .delete()
+      .eq("id", id);
+
+    if (error) {
+      console.error("DELETE /obras/admin/:id error:", error);
+      return res
+        .status(500)
+        .json({ ok: false, error: "Falha ao deletar obra (admin)" });
+    }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("DELETE /obras/admin/:id exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
+// ==================================================
+// START
+// ==================================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`✅ API rodando na porta ${PORT}`));
