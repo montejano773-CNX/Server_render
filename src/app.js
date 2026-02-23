@@ -232,7 +232,30 @@ app.get("/obras/todas", requireAuth, async (req, res) => {
     return res.status(500).json({ ok: false, error: "Erro interno" });
   }
 });
+// ==================================================
+// USUÁRIOS (LISTAR) - para dropdown "Responsável pela obra"
+// Tabela: public.cadastro_user
+// ==================================================
+app.get("/usuarios", requireAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from("cadastro_user")
+      .select("id, nome, email, nivel_acesso, situacao")
+      .order("nome", { ascending: true });
 
+    if (error) {
+      console.error("GET /usuarios error:", error);
+      return res
+        .status(500)
+        .json({ ok: false, error: "Falha ao listar usuários" });
+    }
+
+    return res.json({ ok: true, data: data || [] });
+  } catch (err) {
+    console.error("GET /usuarios exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
 // ==================================================
 // USERS (criar usuário via API)
 // - cria usuário no Supabase Auth (admin)
