@@ -363,7 +363,139 @@ app.delete("/usuarios/:id", requireAuth, async (req, res) => {
     return res.status(500).json({ ok: false, error: "Erro interno" });
   }
 });
+// ==================================================
+// RELATÓRIOS
+// GET /relatorios/pagamento?inicio=YYYY-MM-DD&fim=YYYY-MM-DD
+// - Soma diárias: (qtd || 1) * (valor_diaria_aplicado || 0)
+// - Soma empreitas: valor
+// ==================================================
+app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
+  try {
+    const inicio = String(req.query?.inicio || "").trim();
+    const fim = String(req.query?.fim || "").trim();
 
+    if (!inicio || !fim) {
+      return res.status(400).json({
+        ok: false,
+        error: "Informe inicio e fim no formato YYYY-MM-DD",
+      });
+    }
+
+    // 1) Funcionários
+    const { data: funcionarios, error: errFunc } = await supabaseAdmin
+      .from("cadastro_func")
+      .select(
+        "id, nome, apelido, funcao, razao_social, titular_conta, cpf, banco, agencia, conta, chave_pix, situacao",
+      )
+      .order("nome", { ascending: true });
+
+    if (errFunc) {
+      console.error("GET /relatorios/pagamento funcionarios error:", errFunc);
+      return res
+        .status(500)
+        .json({ ok: false, error: "Falha ao listar funcionários" });
+    }
+
+    const funcList = funcionarios || [];
+    const funcIds = funcList.map((f) => f.id);
+
+    if (funcIds.length === 0) return res.json({ ok: true, data: [] });
+
+    // 2) Diárias no período (lanc_diarias)
+    const { data: diarias, error: errDiarias } = await supabaseAdmin
+      .from("lanc_diarias")
+      .select("funcionario_id, data, qtd, valor_diaria_aplicado")
+      .in("funcionario_id", funcIds)
+      .gte("data", inicio)
+      .lte("data", fim);
+
+    if (errDiarias) {
+      console.error("GET /relatorios/pagamento diarias error:", errDiarias);
+      return res
+        .status(500)
+        .json({ ok: false, error: "Falha ao buscar diárias" });
+    }
+
+    // 3) Empreitas no período (empreitas)
+    const { data: empreitas, error: errEmp } = await supabaseAdmin
+      .from("empreitas")
+      .select("funcionario_id, data_pagamento, valor")
+      .in("funcionario_id", funcIds)
+      .gte("data_pagamento", inicio)
+      .lte("data_pagamento", fim);
+
+    if (errEmp) {
+      console.error("GET /relatorios/pagamento empreitas error:", errEmp);
+      return res
+        .status(500)
+        .json({ ok: false, error: "Falha ao buscar empreitas" });
+    }
+
+    // 4) Montagem do agregador
+    // map[funcId] = { dias: { "YYYY-MM-DD": { diaria, empreita } }, total_diaria, total_empreita }
+    const map = new Map();
+
+    function ensure(funcId) {
+      if (!map.has(funcId)) {
+        map.set(funcId, {
+          dias: {},
+          total_diaria: 0,
+          total_empreita: 0,
+        });
+      }
+      return map.get(funcId);
+    }
+
+    // Diárias: (qtd || 1) * valor_diaria_aplicado
+    for (const row of diarias || []) {
+      const funcId = row.funcionario_id;
+      const dia = row.data; // YYYY-MM-DD
+      const qtd = Number(row.qtd ?? 1);
+      const v = Number(row.valor_diaria_aplicado ?? 0);
+      const valorDia =
+        (Number.isFinite(qtd) ? qtd : 1) * (Number.isFinite(v) ? v : 0);
+
+      const obj = ensure(funcId);
+      if (!obj.dias[dia]) obj.dias[dia] = { diaria: 0, empreita: 0 };
+
+      obj.dias[dia].diaria += valorDia;
+      obj.total_diaria += valorDia;
+    }
+
+    // Empreitas: soma por data_pagamento (pode ter várias no mesmo dia)
+    for (const row of empreitas || []) {
+      const funcId = row.funcionario_id;
+      const dia = row.data_pagamento; // YYYY-MM-DD
+      const valor = Number(row.valor ?? 0);
+
+      const obj = ensure(funcId);
+      if (!obj.dias[dia]) obj.dias[dia] = { diaria: 0, empreita: 0 };
+
+      obj.dias[dia].empreita += valor;
+      obj.total_empreita += valor;
+    }
+
+    // 5) Saída pro front
+    const out = funcList.map((f) => {
+      const agg = ensure(f.id);
+      const total_pagar =
+        Number(agg.total_diaria || 0) + Number(agg.total_empreita || 0);
+
+      return {
+        funcionario: f,
+        dias: agg.dias, // { "YYYY-MM-DD": { diaria, empreita } }
+        total_diaria: agg.total_diaria,
+        total_empreita: agg.total_empreita,
+        total_pagar,
+      };
+    });
+
+    return res.json({ ok: true, data: out });
+  } catch (err) {
+    console.error("GET /relatorios/pagamento exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
 // ==================================================
 // FUNCIONÁRIOS (CRUD)
 // Tabela: public.cadastro_func
