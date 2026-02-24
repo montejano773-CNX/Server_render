@@ -80,15 +80,15 @@ app.get("/me", requireAuth, async (req, res) => {
 
     const { data, error } = await supabaseAdmin
       .from("cadastro_user")
-      .select("id, nome, email, nivel_acesso, situacao")
-      .eq("id", authId)
+      .select("id, auth_user_id, nome, email, nivel_acesso, situacao")
+      .eq("auth_user_id", authId) // ✅ CORRETO
       .single();
 
     if (error) {
       console.error("GET /me error:", error);
       return res
-        .status(500)
-        .json({ ok: false, error: "Falha ao carregar perfil" });
+        .status(404)
+        .json({ ok: false, error: "Perfil não encontrado no cadastro_user" });
     }
 
     return res.json({ ok: true, data });
@@ -97,7 +97,6 @@ app.get("/me", requireAuth, async (req, res) => {
     return res.status(500).json({ ok: false, error: "Erro interno" });
   }
 });
-
 // ==================================================
 // USUÁRIOS (CRUD)
 // Tabela: public.cadastro_user
