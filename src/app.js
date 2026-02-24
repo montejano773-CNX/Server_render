@@ -691,6 +691,180 @@ app.delete("/funcionarios/:id", requireAuth, async (req, res) => {
   }
 });
 // ==================================================
+// EQUIPE POR OBRA (CRUD)
+// Tabela: public.equipe_obra
+// ==================================================
+
+// LISTAR vínculos da obra
+app.get("/equipe-obra/:obraId", requireAuth, async (req, res) => {
+  try {
+    const obraId = req.params.obraId;
+
+    if (!isUuid(obraId)) {
+      return res.status(400).json({ ok: false, error: "obraId inválido" });
+    }
+
+    const { data, error } = await supabaseAdmin
+      .from("equipe_obra")
+      .select(
+        "id, obra_id, funcionario_id, valor_diaria, situacao, observacao, created_at",
+      )
+      .eq("obra_id", obraId)
+      .order("created_at", { ascending: true });
+
+    if (error) {
+      console.error("GET /equipe-obra/:obraId error:", error);
+      return res
+        .status(500)
+        .json({ ok: false, error: "Falha ao listar equipe" });
+    }
+
+    return res.json({ ok: true, data: data || [] });
+  } catch (err) {
+    console.error("GET /equipe-obra/:obraId exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
+// CRIAR vínculo (ou reativar se já existir)
+app.post("/equipe-obra", requireAuth, async (req, res) => {
+  try {
+    const obra_id = req.body?.obra_id;
+    const funcionario_id = req.body?.funcionario_id;
+
+    if (!isUuid(obra_id)) {
+      return res.status(400).json({ ok: false, error: "obra_id inválido" });
+    }
+    if (!isUuid(funcionario_id)) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "funcionario_id inválido" });
+    }
+
+    const valor_diaria =
+      req.body?.valor_diaria === "" ||
+      req.body?.valor_diaria === undefined ||
+      req.body?.valor_diaria === null
+        ? null
+        : Number(req.body.valor_diaria);
+
+    if (
+      valor_diaria !== null &&
+      (Number.isNaN(valor_diaria) || valor_diaria < 0)
+    ) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "valor_diaria inválido" });
+    }
+
+    const situacao = normSituacao(req.body?.situacao, "ativo");
+    const observacao = req.body?.observacao
+      ? String(req.body.observacao).trim()
+      : null;
+
+    // Se você NÃO tiver UNIQUE (obra_id, funcionario_id) no banco,
+    // use INSERT simples (vai permitir duplicar vínculos).
+    // Se tiver UNIQUE, pode usar upsert.
+    const { data, error } = await supabaseAdmin
+      .from("equipe_obra")
+      .upsert(
+        { obra_id, funcionario_id, valor_diaria, situacao, observacao },
+        { onConflict: "obra_id,funcionario_id" }, // exige UNIQUE (obra_id, funcionario_id)
+      )
+      .select("id")
+      .single();
+
+    if (error) {
+      console.error("POST /equipe-obra error:", error);
+      return res.status(500).json({ ok: false, error: error.message });
+    }
+
+    return res.status(201).json({ ok: true, data });
+  } catch (err) {
+    console.error("POST /equipe-obra exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
+// EDITAR vínculo
+app.patch("/equipe-obra/:id", requireAuth, async (req, res) => {
+  try {
+    const id = req.params.id;
+    if (!isUuid(id))
+      return res.status(400).json({ ok: false, error: "id inválido" });
+
+    const patch = {};
+
+    if (req.body?.valor_diaria !== undefined) {
+      const v =
+        req.body.valor_diaria === "" || req.body.valor_diaria === null
+          ? null
+          : Number(req.body.valor_diaria);
+
+      if (v !== null && (Number.isNaN(v) || v < 0)) {
+        return res
+          .status(400)
+          .json({ ok: false, error: "valor_diaria inválido" });
+      }
+      patch.valor_diaria = v;
+    }
+
+    if (req.body?.situacao !== undefined)
+      patch.situacao = normSituacao(req.body.situacao);
+    if (req.body?.observacao !== undefined)
+      patch.observacao = req.body.observacao
+        ? String(req.body.observacao).trim()
+        : null;
+
+    if (Object.keys(patch).length === 0) {
+      return res.status(400).json({ ok: false, error: "Nada para atualizar" });
+    }
+
+    const { error } = await supabaseAdmin
+      .from("equipe_obra")
+      .update(patch)
+      .eq("id", id);
+
+    if (error) {
+      console.error("PATCH /equipe-obra/:id error:", error);
+      return res
+        .status(500)
+        .json({ ok: false, error: "Falha ao atualizar vínculo" });
+    }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("PATCH /equipe-obra/:id exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
+// REMOVER (recomendado: inativar)
+app.delete("/equipe-obra/:id", requireAuth, async (req, res) => {
+  try {
+    const id = req.params.id;
+    if (!isUuid(id))
+      return res.status(400).json({ ok: false, error: "id inválido" });
+
+    const { error } = await supabaseAdmin
+      .from("equipe_obra")
+      .update({ situacao: "inativo" })
+      .eq("id", id);
+
+    if (error) {
+      console.error("DELETE /equipe-obra/:id error:", error);
+      return res
+        .status(500)
+        .json({ ok: false, error: "Falha ao remover vínculo" });
+    }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("DELETE /equipe-obra/:id exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+// ==================================================
 // EMPREITAS (CRUD)
 // Tabela: public.empreitas
 // - data_pagamento é o filtro do relatório
