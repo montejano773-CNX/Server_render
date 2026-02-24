@@ -17,23 +17,19 @@ const allowedOrigins = (process.env.CORS_ORIGIN || "")
 app.use(
   cors({
     origin: (origin, callback) => {
-      // permite ferramentas como curl/postman
-      if (!origin) return callback(null, true);
+      // ✅ permite file:// e curl/postman
+      if (!origin || origin === "null") return callback(null, true);
 
-      // se não definiu CORS_ORIGIN, libera tudo
       if (allowedOrigins.length === 0) return callback(null, true);
 
-      // libera se estiver na lista
       if (allowedOrigins.includes(origin)) return callback(null, true);
 
-      // DEBUG útil no Render:
       console.log("❌ CORS BLOQUEADO:", origin, "permitidos:", allowedOrigins);
-
       return callback(new Error(`CORS bloqueado para: ${origin}`));
     },
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
-    credentials: false, // ESSENCIAL (você está usando Bearer token)
+    credentials: false,
   }),
 );
 
@@ -563,7 +559,248 @@ app.delete("/funcionarios/:id", requireAuth, async (req, res) => {
     return res.status(500).json({ ok: false, error: "Erro interno" });
   }
 });
+// ==================================================
+// EMPREITAS (CRUD)
+// Tabela: public.empreitas
+// - data_pagamento é o filtro do relatório
+// - permite múltiplas por dia/func/obra (sem unique)
+// ==================================================
 
+// LISTAR (com filtros por querystring)
+// Exemplos:
+// /empreitas?inicio=2026-02-01&fim=2026-02-15
+// /empreitas?funcionario_id=UUID&inicio=...&fim=...
+// /empreitas?obra_id=UUID&inicio=...&fim=...
+app.get("/empreitas", requireAuth, async (req, res) => {
+  try {
+    const { inicio, fim, obra_id, funcionario_id } = req.query;
+
+    let q = supabaseAdmin
+      .from("empreitas")
+      .select(
+        "id, obra_id, funcionario_id, data_pagamento, valor, descricao, created_at",
+      )
+      .order("data_pagamento", { ascending: true })
+      .order("created_at", { ascending: true });
+
+    if (obra_id) {
+      if (!isUuid(obra_id)) {
+        return res
+          .status(400)
+          .json({ ok: false, error: "obra_id inválido (UUID)" });
+      }
+      q = q.eq("obra_id", obra_id);
+    }
+
+    if (funcionario_id) {
+      if (!isUuid(funcionario_id)) {
+        return res
+          .status(400)
+          .json({ ok: false, error: "funcionario_id inválido (UUID)" });
+      }
+      q = q.eq("funcionario_id", funcionario_id);
+    }
+
+    if (inicio) {
+      // formato esperado: YYYY-MM-DD
+      q = q.gte("data_pagamento", String(inicio));
+    }
+    if (fim) {
+      q = q.lte("data_pagamento", String(fim));
+    }
+
+    const { data, error } = await q;
+
+    if (error) {
+      console.error("GET /empreitas error:", error);
+      return res
+        .status(500)
+        .json({ ok: false, error: "Falha ao listar empreitas" });
+    }
+
+    return res.json({ ok: true, data: data || [] });
+  } catch (err) {
+    console.error("GET /empreitas exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
+// BUSCAR POR ID
+app.get("/empreitas/:id", requireAuth, async (req, res) => {
+  try {
+    const id = req.params.id;
+
+    const { data, error } = await supabaseAdmin
+      .from("empreitas")
+      .select("*")
+      .eq("id", id)
+      .single();
+
+    if (error) {
+      console.error("GET /empreitas/:id error:", error);
+      return res
+        .status(404)
+        .json({ ok: false, error: "Empreita não encontrada" });
+    }
+
+    return res.json({ ok: true, data });
+  } catch (err) {
+    console.error("GET /empreitas/:id exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
+// CRIAR
+app.post("/empreitas", requireAuth, async (req, res) => {
+  try {
+    const obra_id = req.body?.obra_id;
+    const funcionario_id = req.body?.funcionario_id;
+    const data_pagamento = req.body?.data_pagamento;
+    const valorRaw = req.body?.valor;
+    const descricao = req.body?.descricao
+      ? String(req.body.descricao).trim()
+      : null;
+
+    if (!isUuid(obra_id)) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "obra_id é obrigatório (UUID)" });
+    }
+    if (!isUuid(funcionario_id)) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "funcionario_id é obrigatório (UUID)" });
+    }
+    if (!data_pagamento) {
+      return res.status(400).json({
+        ok: false,
+        error: "data_pagamento é obrigatória (YYYY-MM-DD)",
+      });
+    }
+
+    const valor = Number(valorRaw);
+    if (!Number.isFinite(valor) || valor < 0) {
+      return res.status(400).json({ ok: false, error: "valor inválido" });
+    }
+
+    const payload = {
+      obra_id,
+      funcionario_id,
+      data_pagamento: String(data_pagamento),
+      valor,
+      descricao,
+      created_by: req.authUser?.id || null,
+    };
+
+    const { data, error } = await supabaseAdmin
+      .from("empreitas")
+      .insert(payload)
+      .select("id")
+      .single();
+
+    if (error) {
+      console.error("POST /empreitas error:", error);
+      return res
+        .status(500)
+        .json({ ok: false, error: "Falha ao salvar empreita" });
+    }
+
+    return res.status(201).json({ ok: true, data });
+  } catch (err) {
+    console.error("POST /empreitas exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
+// EDITAR (PATCH)
+app.patch("/empreitas/:id", requireAuth, async (req, res) => {
+  try {
+    const id = req.params.id;
+
+    const patch = {
+      ...(req.body?.obra_id !== undefined
+        ? (() => {
+            if (!isUuid(req.body.obra_id))
+              throw new Error("obra_id inválido (UUID)");
+            return { obra_id: req.body.obra_id };
+          })()
+        : {}),
+      ...(req.body?.funcionario_id !== undefined
+        ? (() => {
+            if (!isUuid(req.body.funcionario_id))
+              throw new Error("funcionario_id inválido (UUID)");
+            return { funcionario_id: req.body.funcionario_id };
+          })()
+        : {}),
+      ...(req.body?.data_pagamento !== undefined
+        ? { data_pagamento: String(req.body.data_pagamento) }
+        : {}),
+      ...(req.body?.valor !== undefined
+        ? (() => {
+            const v = Number(req.body.valor);
+            if (!Number.isFinite(v) || v < 0) throw new Error("valor inválido");
+            return { valor: v };
+          })()
+        : {}),
+      ...(req.body?.descricao !== undefined
+        ? {
+            descricao: req.body.descricao
+              ? String(req.body.descricao).trim()
+              : null,
+          }
+        : {}),
+    };
+
+    if (Object.keys(patch).length === 0) {
+      return res.status(400).json({ ok: false, error: "Nada para atualizar" });
+    }
+
+    const { error } = await supabaseAdmin
+      .from("empreitas")
+      .update(patch)
+      .eq("id", id);
+
+    if (error) {
+      console.error("PATCH /empreitas/:id error:", error);
+      return res
+        .status(500)
+        .json({ ok: false, error: "Falha ao atualizar empreita" });
+    }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    const msg = String(err?.message || "");
+    if (msg.includes("inválido")) {
+      return res.status(400).json({ ok: false, error: msg });
+    }
+    console.error("PATCH /empreitas/:id exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
+// DELETAR
+app.delete("/empreitas/:id", requireAuth, async (req, res) => {
+  try {
+    const id = req.params.id;
+
+    const { error } = await supabaseAdmin
+      .from("empreitas")
+      .delete()
+      .eq("id", id);
+
+    if (error) {
+      console.error("DELETE /empreitas/:id error:", error);
+      return res
+        .status(500)
+        .json({ ok: false, error: "Falha ao deletar empreita" });
+    }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("DELETE /empreitas/:id exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
 // ==================================================
 // OBRAS (CRUD)
 // Tabela: public.cadastro_obra
