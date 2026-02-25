@@ -1050,35 +1050,38 @@ app.post("/diarias-ajustes", requireAuth, async (req, res) => {
         );
       }
 
-      // ✅ compat: se vier centavos, converte para reais
-      const reembolsoFromCentavos =
-        a.reembolso_centavos !== undefined && a.reembolso_centavos !== null
-          ? Number(a.reembolso_centavos) / 100
-          : null;
+      // centavos do front
+      const reembolso_centavos = Number(a.reembolso_centavos ?? 0);
+      const adiantamento_centavos = Number(a.adiantamento_centavos ?? 0);
 
-      const adiantFromCentavos =
-        a.adiantamento_centavos !== undefined &&
-        a.adiantamento_centavos !== null
-          ? Number(a.adiantamento_centavos) / 100
-          : null;
+      if (!Number.isFinite(reembolso_centavos) || reembolso_centavos < 0) {
+        throw new Error("reembolso_centavos inválido.");
+      }
+      if (
+        !Number.isFinite(adiantamento_centavos) ||
+        adiantamento_centavos < 0
+      ) {
+        throw new Error("adiantamento_centavos inválido.");
+      }
 
-      // ✅ schema final (numeric)
-      const reembolso =
-        a.reembolso !== undefined && a.reembolso !== null
-          ? Number(a.reembolso)
-          : (reembolsoFromCentavos ?? 0);
+      // ✅ banco: numeric (reais)
+      const reembolso = reembolso_centavos / 100;
+      const adiantamento = adiantamento_centavos / 100;
 
-      const adiantamento =
-        a.adiantamento !== undefined && a.adiantamento !== null
-          ? Number(a.adiantamento)
-          : (adiantFromCentavos ?? 0);
+      // ✅ valor da diária snapshot (numeric)
+      const valor = Number(a.valor ?? 0);
+      if (!Number.isFinite(valor) || valor < 0) {
+        throw new Error("valor (diária) inválido.");
+      }
 
-      if (!Number.isFinite(reembolso) || reembolso < 0)
-        throw new Error("reembolso inválido.");
-      if (!Number.isFinite(adiantamento) || adiantamento < 0)
-        throw new Error("adiantamento inválido.");
-
-      return { obra_id, funcionario_id, data_inicio, reembolso, adiantamento };
+      return {
+        obra_id,
+        funcionario_id,
+        data_inicio,
+        reembolso,
+        adiantamento,
+        valor, // ✅ salva a diária do período
+      };
     });
 
     const { error } = await supabaseAdmin
@@ -1089,7 +1092,7 @@ app.post("/diarias-ajustes", requireAuth, async (req, res) => {
       console.error("POST /diarias-ajustes error:", error);
       return res
         .status(500)
-        .json({ ok: false, error: "Erro ao salvar ajustes" });
+        .json({ ok: false, error: error.message || "Erro ao salvar ajustes" });
     }
 
     return res.json({ ok: true });
@@ -1275,12 +1278,10 @@ app.post("/empreitas", requireAuth, async (req, res) => {
         .json({ ok: false, error: "funcionario_id é obrigatório (UUID)" });
     }
     if (!data_pagamento) {
-      return res
-        .status(400)
-        .json({
-          ok: false,
-          error: "data_pagamento é obrigatória (YYYY-MM-DD)",
-        });
+      return res.status(400).json({
+        ok: false,
+        error: "data_pagamento é obrigatória (YYYY-MM-DD)",
+      });
     }
 
     const valor = Number(valorRaw);
