@@ -857,6 +857,249 @@ app.delete("/equipe-obra/:id", requireAuth, async (req, res) => {
     return res.status(500).json({ ok: false, error: "Erro interno" });
   }
 });
+// =====================================================
+// DIÁRIAS - SELECT + UPSERT (lanc_diarias)
+// =====================================================
+
+// GET /lanc-diarias?obra_id=UUID&data_ini=YYYY-MM-DD&data_fim=YYYY-MM-DD
+app.get("/lanc-diarias", async (req, res) => {
+  try {
+    const { obra_id, data_ini, data_fim } = req.query;
+
+    if (!obra_id || !data_ini || !data_fim) {
+      return res
+        .status(400)
+        .json({ error: "obra_id, data_ini e data_fim são obrigatórios." });
+    }
+
+    const { data, error } = await supabase
+      .from("lanc_diarias")
+      .select("obra_id, funcionario_id, data, qtd, valor_diaria_aplicado")
+      .eq("obra_id", obra_id)
+      .gte("data", data_ini)
+      .lte("data", data_fim);
+
+    if (error) {
+      console.error("Erro GET /lanc-diarias:", error);
+      return res.status(500).json({ error: "Erro ao buscar diárias." });
+    }
+
+    return res.json({ data: data || [] });
+  } catch (e) {
+    console.error("Falha GET /lanc-diarias:", e);
+    return res.status(500).json({ error: "Erro interno." });
+  }
+});
+
+// POST /lanc-diarias  (upsert em lote)
+// Body: [{ obra_id, funcionario_id, data, qtd, valor_diaria_aplicado }]
+app.post("/lanc-diarias", async (req, res) => {
+  try {
+    const payload = req.body;
+    const rows = Array.isArray(payload) ? payload : [payload];
+
+    if (!rows.length) {
+      return res.status(400).json({ error: "Body vazio." });
+    }
+
+    const normalized = rows.map((r) => {
+      if (!r.obra_id || !r.funcionario_id || !r.data) {
+        throw new Error("obra_id, funcionario_id e data são obrigatórios.");
+      }
+      const qtd = Number(r.qtd);
+      const vda = Number(r.valor_diaria_aplicado);
+
+      if (!Number.isFinite(qtd)) throw new Error("qtd inválido.");
+      if (!Number.isFinite(vda) || vda <= 0)
+        throw new Error("valor_diaria_aplicado inválido.");
+
+      return {
+        obra_id: r.obra_id,
+        funcionario_id: r.funcionario_id,
+        data: r.data,
+        qtd,
+        valor_diaria_aplicado: vda,
+      };
+    });
+
+    // IMPORTANTE: precisa UNIQUE (obra_id, funcionario_id, data) no banco
+    const { data, error } = await supabase
+      .from("lanc_diarias")
+      .upsert(normalized, { onConflict: "obra_id,funcionario_id,data" })
+      .select("obra_id, funcionario_id, data, qtd, valor_diaria_aplicado");
+
+    if (error) {
+      console.error("Erro POST /lanc-diarias:", error);
+      return res.status(500).json({ error: "Erro ao salvar diárias." });
+    }
+
+    return res.json({ ok: true, data: data || [] });
+  } catch (e) {
+    console.error("Falha POST /lanc-diarias:", e);
+    return res
+      .status(400)
+      .json({ error: e.message || "Erro ao processar diárias." });
+  }
+});
+
+// =====================================================
+// AJUSTES DO PERÍODO (lanc_diarias_ajustes)
+// - guarda reembolso e adiantamento por obra + funcionário + data_inicio
+// =====================================================
+
+// GET /diarias-ajustes?obra_id=UUID&data_inicio=YYYY-MM-DD
+app.get("/diarias-ajustes", async (req, res) => {
+  try {
+    const { obra_id, data_inicio } = req.query;
+
+    if (!obra_id || !data_inicio) {
+      return res
+        .status(400)
+        .json({ error: "obra_id e data_inicio são obrigatórios." });
+    }
+
+    const { data, error } = await supabase
+      .from("lanc_diarias_ajustes")
+      .select("obra_id, funcionario_id, data_inicio, reembolso, adiantamento")
+      .eq("obra_id", obra_id)
+      .eq("data_inicio", data_inicio);
+
+    if (error) {
+      console.error("Erro GET /diarias-ajustes:", error);
+      return res
+        .status(500)
+        .json({ error: "Erro ao buscar ajustes do período." });
+    }
+
+    return res.json({ data: data || [] });
+  } catch (e) {
+    console.error("Falha GET /diarias-ajustes:", e);
+    return res.status(500).json({ error: "Erro interno." });
+  }
+});
+
+// POST /diarias-ajustes (upsert)
+// Body: [{ obra_id, funcionario_id, data_inicio, reembolso, adiantamento }]
+app.post("/diarias-ajustes", async (req, res) => {
+  try {
+    const payload = req.body;
+    const rows = Array.isArray(payload) ? payload : [payload];
+
+    if (!rows.length) {
+      return res.status(400).json({ error: "Body vazio." });
+    }
+
+    const normalized = rows.map((r) => {
+      if (!r.obra_id || !r.funcionario_id || !r.data_inicio) {
+        throw new Error(
+          "obra_id, funcionario_id e data_inicio são obrigatórios.",
+        );
+      }
+
+      const reembolso = Number(r.reembolso || 0);
+      const adiantamento = Number(r.adiantamento || 0);
+
+      return {
+        obra_id: r.obra_id,
+        funcionario_id: r.funcionario_id,
+        data_inicio: r.data_inicio,
+        reembolso: Number.isFinite(reembolso) ? reembolso : 0,
+        adiantamento: Number.isFinite(adiantamento) ? adiantamento : 0,
+      };
+    });
+
+    // IMPORTANTE: precisa UNIQUE (obra_id, funcionario_id, data_inicio)
+    const { data, error } = await supabase
+      .from("lanc_diarias_ajustes")
+      .upsert(normalized, { onConflict: "obra_id,funcionario_id,data_inicio" })
+      .select("obra_id, funcionario_id, data_inicio, reembolso, adiantamento");
+
+    if (error) {
+      console.error("Erro POST /diarias-ajustes:", error);
+      return res
+        .status(500)
+        .json({ error: "Erro ao salvar ajustes do período." });
+    }
+
+    return res.json({ ok: true, data: data || [] });
+  } catch (e) {
+    console.error("Falha POST /diarias-ajustes:", e);
+    return res
+      .status(400)
+      .json({ error: e.message || "Erro ao processar ajustes." });
+  }
+});
+
+// =====================================================
+// EQUIPE OBRA (todas) - para combo EXTRA
+// =====================================================
+// GET /equipe-obra/todas -> lista todos vínculos ativos + nomes (pra tela diárias)
+// (se você já tem isso, pode ignorar)
+app.get("/equipe-obra/todas", async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("equipe_obra")
+      .select("obra_id, funcionario_id, valor_diaria, situacao");
+
+    if (error) {
+      console.error("Erro GET /equipe-obra/todas:", error);
+      return res
+        .status(500)
+        .json({ error: "Erro ao buscar equipe_obra (todas)." });
+    }
+
+    // buscar nomes em 2 consultas simples (pra não depender de join)
+    const obraIds = [
+      ...new Set((data || []).map((r) => r.obra_id).filter(Boolean)),
+    ];
+    const funcIds = [
+      ...new Set((data || []).map((r) => r.funcionario_id).filter(Boolean)),
+    ];
+
+    const obrasResp = await supabase
+      .from("cadastro_obra")
+      .select("id, nome, situacao")
+      .in(
+        "id",
+        obraIds.length ? obraIds : ["00000000-0000-0000-0000-000000000000"],
+      );
+
+    const funcsResp = await supabase
+      .from("cadastro_func")
+      .select("id, nome, funcao, situacao")
+      .in(
+        "id",
+        funcIds.length ? funcIds : ["00000000-0000-0000-0000-000000000000"],
+      );
+
+    const obrasMap = {};
+    (obrasResp.data || []).forEach((o) => (obrasMap[o.id] = o));
+
+    const funcsMap = {};
+    (funcsResp.data || []).forEach((f) => (funcsMap[f.id] = f));
+
+    const enriched = (data || []).map((r) => {
+      const obra = obrasMap[r.obra_id] || {};
+      const func = funcsMap[r.funcionario_id] || {};
+      return {
+        obra_id: r.obra_id,
+        funcionario_id: r.funcionario_id,
+        valor_diaria: r.valor_diaria,
+        situacao: r.situacao,
+        obra_nome: obra.nome || null,
+        obra_situacao: obra.situacao || null,
+        funcionario_nome: func.nome || null,
+        funcionario_funcao: func.funcao || null,
+        funcionario_situacao: func.situacao || null,
+      };
+    });
+
+    return res.json({ data: enriched });
+  } catch (e) {
+    console.error("Falha GET /equipe-obra/todas:", e);
+    return res.status(500).json({ error: "Erro interno." });
+  }
+});
 // ==================================================
 // EMPREITAS (CRUD)
 // Tabela: public.empreitas
