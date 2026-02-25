@@ -982,6 +982,7 @@ app.get("/diarias-ajustes", async (req, res) => {
 // Body: [{ obra_id, funcionario_id, data_inicio, reembolso, adiantamento }]
 app.post("/diarias-ajustes", async (req, res) => {
   try {
+    console.log("POST /lanc-diarias body =", req.body);
     const payload = req.body;
     const rows = Array.isArray(payload) ? payload : [payload];
 
