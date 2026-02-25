@@ -547,7 +547,18 @@ app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
       obj.dias[dia].empreita += valor;
       obj.total_empreita += valor;
     }
+    // Ajustes (reembolso / adiantamento)
+    for (const row of ajustesRows || []) {
+      const funcId = row.funcionario_id;
+      const reembolso = Number(row.reembolso ?? 0);
+      const adiantamento = Number(row.adiantamento ?? 0);
 
+      const obj = ensure(funcId);
+      obj.total_reembolso += Number.isFinite(reembolso) ? reembolso : 0;
+      obj.total_adiantamento += Number.isFinite(adiantamento)
+        ? adiantamento
+        : 0;
+    }
     const out = funcList.map((f) => {
       const agg = ensure(f.id);
 
@@ -577,16 +588,6 @@ app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
     return res.status(500).json({ ok: false, error: "Erro interno" });
   }
 });
-// Ajustes (reembolso / adiantamento)
-for (const row of ajustesRows || []) {
-  const funcId = row.funcionario_id;
-  const reembolso = Number(row.reembolso ?? 0);
-  const adiantamento = Number(row.adiantamento ?? 0);
-
-  const obj = ensure(funcId);
-  obj.total_reembolso += Number.isFinite(reembolso) ? reembolso : 0;
-  obj.total_adiantamento += Number.isFinite(adiantamento) ? adiantamento : 0;
-}
 // ==================================================
 // FUNCIONÁRIOS (CRUD) - public.cadastro_func
 // (mantive seu campo "observaco" como estava no seu código)
