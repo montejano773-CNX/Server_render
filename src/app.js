@@ -978,59 +978,157 @@ app.get("/diarias-ajustes", async (req, res) => {
   }
 });
 
-// POST /diarias-ajustes (upsert)
-// Body: [{ obra_id, funcionario_id, data_inicio, reembolso, adiantamento }]
-app.post("/diarias-ajustes", async (req, res) => {
+app.get("/lanc-diarias", authMiddleware, async (req, res) => {
   try {
-    console.log("POST /lanc-diarias body =", req.body);
-    const payload = req.body;
-    const rows = Array.isArray(payload) ? payload : [payload];
+    const { obra_id, data_inicio, data_fim } = req.query;
 
-    if (!rows.length) {
-      return res.status(400).json({ error: "Body vazio." });
-    }
-
-    const normalized = rows.map((r) => {
-      if (!r.obra_id || !r.funcionario_id || !r.data_inicio) {
-        throw new Error(
-          "obra_id, funcionario_id e data_inicio são obrigatórios.",
-        );
-      }
-
-      const reembolso = Number(r.reembolso || 0);
-      const adiantamento = Number(r.adiantamento || 0);
-
-      return {
-        obra_id: r.obra_id,
-        funcionario_id: r.funcionario_id,
-        data_inicio: r.data_inicio,
-        reembolso: Number.isFinite(reembolso) ? reembolso : 0,
-        adiantamento: Number.isFinite(adiantamento) ? adiantamento : 0,
-      };
-    });
-
-    // IMPORTANTE: precisa UNIQUE (obra_id, funcionario_id, data_inicio)
-    const { data, error } = await supabase
-      .from("lanc_diarias_ajustes")
-      .upsert(normalized, { onConflict: "obra_id,funcionario_id,data_inicio" })
-      .select("obra_id, funcionario_id, data_inicio, reembolso, adiantamento");
-
-    if (error) {
-      console.error("Erro POST /diarias-ajustes:", error);
+    if (!obra_id || !data_inicio || !data_fim) {
       return res
-        .status(500)
-        .json({ error: "Erro ao salvar ajustes do período." });
+        .status(400)
+        .json({
+          error: "Parâmetros obrigatórios: obra_id, data_inicio, data_fim",
+        });
     }
 
-    return res.json({ ok: true, data: data || [] });
+    const { data, error } = await supabaseAdmin
+      .from("lanc_diarias")
+      .select("obra_id, funcionario_id, data, qtd, valor_diaria_aplicado")
+      .eq("obra_id", obra_id)
+      .gte("data", data_inicio)
+      .lte("data", data_fim);
+
+    if (error) return res.status(400).json({ error: error.message });
+    return res.json({ data: data || [] });
   } catch (e) {
-    console.error("Falha POST /diarias-ajustes:", e);
-    return res
-      .status(400)
-      .json({ error: e.message || "Erro ao processar ajustes." });
+    console.error("GET /lanc-diarias:", e);
+    return res.status(500).json({ error: "Erro interno." });
   }
 });
+app.post("/lanc-diarias", authMiddleware, async (req, res) => {
+  try {
+    const registros = req.body?.registros;
 
+    if (!Array.isArray(registros) || !registros.length) {
+      return res.status(400).json({ error: "Envie { registros: [...] }" });
+    }
+
+    // valida mínimo
+    for (const r of registros) {
+      if (!r.obra_id || !r.funcionario_id || !r.data) {
+        return res
+          .status(400)
+          .json({ error: "Registro inválido (obra_id/funcionario_id/data)." });
+      }
+    }
+
+    const { error } = await supabaseAdmin
+      .from("lanc_diarias")
+      .upsert(registros, { onConflict: "obra_id,funcionario_id,data" });
+
+    if (error) return res.status(400).json({ error: error.message });
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("POST /lanc-diarias:", e);
+    return res.status(500).json({ error: "Erro interno." });
+  }
+});
+app.get("/diarias-ajustes", authMiddleware, async (req, res) => {
+  try {
+    const { obra_id, data_inicio } = req.query;
+
+    if (!obra_id || !data_inicio) {
+      return res
+        .status(400)
+        .json({ error: "Parâmetros obrigatórios: obra_id, data_inicio" });
+    }
+
+    const { data, error } = await supabaseAdmin
+      .from("lanc_diarias_ajustes")
+      .select(
+        "obra_id, funcionario_id, data_inicio, reembolso_centavos, adiantamento_centavos",
+      )
+      .eq("obra_id", obra_id)
+      .eq("data_inicio", data_inicio);
+
+    if (error) return res.status(400).json({ error: error.message });
+    return res.json({ data: data || [] });
+  } catch (e) {
+    console.error("GET /diarias-ajustes:", e);
+    return res.status(500).json({ error: "Erro interno." });
+  }
+});
+app.post("/diarias-ajustes", authMiddleware, async (req, res) => {
+  try {
+    const ajustes = req.body?.ajustes;
+
+    if (!Array.isArray(ajustes)) {
+      return res.status(400).json({ error: "Envie { ajustes: [...] }" });
+    }
+
+    // permite salvar 0/0 (pra “limpar”)
+    for (const a of ajustes) {
+      if (!a.obra_id || !a.funcionario_id || !a.data_inicio) {
+        return res
+          .status(400)
+          .json({
+            error: "Ajuste inválido (obra_id/funcionario_id/data_inicio).",
+          });
+      }
+      a.reembolso_centavos = Number(a.reembolso_centavos || 0);
+      a.adiantamento_centavos = Number(a.adiantamento_centavos || 0);
+    }
+
+    const { error } = await supabaseAdmin
+      .from("lanc_diarias_ajustes")
+      .upsert(ajustes, { onConflict: "obra_id,funcionario_id,data_inicio" });
+
+    if (error) return res.status(400).json({ error: error.message });
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("POST /diarias-ajustes:", e);
+    return res.status(500).json({ error: "Erro interno." });
+  }
+});
+app.get("/funcionarios-vinculados", authMiddleware, async (req, res) => {
+  try {
+    // pega vínculos ativos + funcionario + obra (ativos) e diária > 0
+    const { data, error } = await supabaseAdmin
+      .from("equipe_obra")
+      .select(
+        `
+        obra_id,
+        funcionario_id,
+        valor_diaria,
+        situacao,
+        funcionario:cadastro_func ( id, nome, funcao, situacao ),
+        obra:cadastro_obra ( id, nome, situacao )
+      `,
+      )
+      .eq("situacao", "ativo");
+
+    if (error) return res.status(400).json({ error: error.message });
+
+    const rows = (data || [])
+      .filter((r) => r.funcionario && r.funcionario.situacao === "ativo")
+      .filter((r) => r.obra && r.obra.situacao === "ativo")
+      .filter((r) => r.valor_diaria != null && Number(r.valor_diaria) > 0)
+      .map((r) => ({
+        id: r.funcionario.id,
+        nome: r.funcionario.nome,
+        funcao: r.funcionario.funcao || null,
+        valor_diaria: Number(r.valor_diaria),
+        obra_id: r.obra_id,
+        obra_nome: r.obra?.nome || null,
+      }));
+
+    return res.json({ data: rows });
+  } catch (e) {
+    console.error("GET /funcionarios-vinculados:", e);
+    return res.status(500).json({ error: "Erro interno." });
+  }
+});
 // =====================================================
 // EQUIPE OBRA (todas) - para combo EXTRA
 // =====================================================
