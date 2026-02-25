@@ -693,15 +693,22 @@ app.delete("/funcionarios/:id", requireAuth, async (req, res) => {
 // ==================================================
 // EQUIPE POR OBRA (CRUD)
 // Tabela: public.equipe_obra
+// - lista por obra
+// - adiciona (upsert manual por obra_id + funcionario_id)
+// - remove (inativa)
 // ==================================================
 
-// LISTAR vínculos da obra
-app.get("/equipe-obra/:obraId", requireAuth, async (req, res) => {
+// LISTAR EQUIPE DA OBRA
+// GET /equipe-obra?obra_id=UUID
+app.get("/equipe-obra", requireAuth, async (req, res) => {
   try {
-    const obraId = req.params.obraId;
+    const obraId = String(req.query?.obra_id || "").trim();
 
     if (!isUuid(obraId)) {
-      return res.status(400).json({ ok: false, error: "obraId inválido" });
+      return res.status(400).json({
+        ok: false,
+        error: "obra_id inválido (precisa ser UUID)",
+      });
     }
 
     const { data, error } = await supabaseAdmin
@@ -710,10 +717,11 @@ app.get("/equipe-obra/:obraId", requireAuth, async (req, res) => {
         "id, obra_id, funcionario_id, valor_diaria, situacao, observacao, created_at",
       )
       .eq("obra_id", obraId)
+      // se seu banco não tiver created_at, troque para .order("id", { ascending: true })
       .order("created_at", { ascending: true });
 
     if (error) {
-      console.error("GET /equipe-obra/:obraId error:", error);
+      console.error("GET /equipe-obra error:", error);
       return res
         .status(500)
         .json({ ok: false, error: "Falha ao listar equipe" });
@@ -721,40 +729,44 @@ app.get("/equipe-obra/:obraId", requireAuth, async (req, res) => {
 
     return res.json({ ok: true, data: data || [] });
   } catch (err) {
-    console.error("GET /equipe-obra/:obraId exception:", err);
+    console.error("GET /equipe-obra exception:", err);
     return res.status(500).json({ ok: false, error: "Erro interno" });
   }
 });
 
-// CRIAR vínculo (ou reativar se já existir)
+// ADICIONAR / ATUALIZAR (UPSERT MANUAL)
+// POST /equipe-obra
+// body: { obra_id, funcionario_id, valor_diaria, situacao, observacao }
 app.post("/equipe-obra", requireAuth, async (req, res) => {
   try {
-    const obra_id = req.body?.obra_id;
-    const funcionario_id = req.body?.funcionario_id;
+    const obra_id = String(req.body?.obra_id || "").trim();
+    const funcionario_id = String(req.body?.funcionario_id || "").trim();
 
     if (!isUuid(obra_id)) {
-      return res.status(400).json({ ok: false, error: "obra_id inválido" });
+      return res
+        .status(400)
+        .json({ ok: false, error: "obra_id inválido (UUID)" });
     }
     if (!isUuid(funcionario_id)) {
       return res
         .status(400)
-        .json({ ok: false, error: "funcionario_id inválido" });
+        .json({ ok: false, error: "funcionario_id inválido (UUID)" });
     }
 
-    const valor_diaria =
-      req.body?.valor_diaria === "" ||
-      req.body?.valor_diaria === undefined ||
-      req.body?.valor_diaria === null
-        ? null
-        : Number(req.body.valor_diaria);
-
+    // valor_diaria opcional
+    let valor_diaria = null;
     if (
-      valor_diaria !== null &&
-      (Number.isNaN(valor_diaria) || valor_diaria < 0)
+      req.body?.valor_diaria !== undefined &&
+      req.body?.valor_diaria !== null &&
+      req.body?.valor_diaria !== ""
     ) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "valor_diaria inválido" });
+      const n = Number(req.body.valor_diaria);
+      if (Number.isNaN(n) || n < 0) {
+        return res
+          .status(400)
+          .json({ ok: false, error: "valor_diaria inválido" });
+      }
+      valor_diaria = n;
     }
 
     const situacao = normSituacao(req.body?.situacao, "ativo");
@@ -762,89 +774,70 @@ app.post("/equipe-obra", requireAuth, async (req, res) => {
       ? String(req.body.observacao).trim()
       : null;
 
-    // Se você NÃO tiver UNIQUE (obra_id, funcionario_id) no banco,
-    // use INSERT simples (vai permitir duplicar vínculos).
-    // Se tiver UNIQUE, pode usar upsert.
-    const { data, error } = await supabaseAdmin
+    // 1) verifica se já existe vínculo pra (obra_id, funcionario_id)
+    const { data: existente, error: selErr } = await supabaseAdmin
       .from("equipe_obra")
-      .upsert(
-        { obra_id, funcionario_id, valor_diaria, situacao, observacao },
-        { onConflict: "obra_id,funcionario_id" }, // exige UNIQUE (obra_id, funcionario_id)
-      )
       .select("id")
-      .single();
+      .eq("obra_id", obra_id)
+      .eq("funcionario_id", funcionario_id)
+      .order("created_at", { ascending: false })
+      .limit(1);
 
-    if (error) {
-      console.error("POST /equipe-obra error:", error);
-      return res.status(500).json({ ok: false, error: error.message });
+    if (selErr) {
+      console.error("POST /equipe-obra select existente error:", selErr);
+      return res
+        .status(500)
+        .json({ ok: false, error: "Falha ao verificar vínculo" });
     }
 
-    return res.status(201).json({ ok: true, data });
+    // 2) se existe -> update, senão -> insert
+    if (existente && existente.length > 0) {
+      const id = existente[0].id;
+
+      const { error: upErr } = await supabaseAdmin
+        .from("equipe_obra")
+        .update({ valor_diaria, situacao, observacao })
+        .eq("id", id);
+
+      if (upErr) {
+        console.error("POST /equipe-obra update error:", upErr);
+        return res
+          .status(500)
+          .json({ ok: false, error: "Falha ao atualizar vínculo" });
+      }
+
+      return res.status(200).json({ ok: true, data: { id, updated: true } });
+    } else {
+      const { data: ins, error: insErr } = await supabaseAdmin
+        .from("equipe_obra")
+        .insert({ obra_id, funcionario_id, valor_diaria, situacao, observacao })
+        .select("id")
+        .single();
+
+      if (insErr) {
+        console.error("POST /equipe-obra insert error:", insErr);
+        return res
+          .status(500)
+          .json({ ok: false, error: "Falha ao criar vínculo" });
+      }
+
+      return res.status(201).json({ ok: true, data: ins });
+    }
   } catch (err) {
     console.error("POST /equipe-obra exception:", err);
     return res.status(500).json({ ok: false, error: "Erro interno" });
   }
 });
 
-// EDITAR vínculo
-app.patch("/equipe-obra/:id", requireAuth, async (req, res) => {
-  try {
-    const id = req.params.id;
-    if (!isUuid(id))
-      return res.status(400).json({ ok: false, error: "id inválido" });
-
-    const patch = {};
-
-    if (req.body?.valor_diaria !== undefined) {
-      const v =
-        req.body.valor_diaria === "" || req.body.valor_diaria === null
-          ? null
-          : Number(req.body.valor_diaria);
-
-      if (v !== null && (Number.isNaN(v) || v < 0)) {
-        return res
-          .status(400)
-          .json({ ok: false, error: "valor_diaria inválido" });
-      }
-      patch.valor_diaria = v;
-    }
-
-    if (req.body?.situacao !== undefined)
-      patch.situacao = normSituacao(req.body.situacao);
-    if (req.body?.observacao !== undefined)
-      patch.observacao = req.body.observacao
-        ? String(req.body.observacao).trim()
-        : null;
-
-    if (Object.keys(patch).length === 0) {
-      return res.status(400).json({ ok: false, error: "Nada para atualizar" });
-    }
-
-    const { error } = await supabaseAdmin
-      .from("equipe_obra")
-      .update(patch)
-      .eq("id", id);
-
-    if (error) {
-      console.error("PATCH /equipe-obra/:id error:", error);
-      return res
-        .status(500)
-        .json({ ok: false, error: "Falha ao atualizar vínculo" });
-    }
-
-    return res.json({ ok: true });
-  } catch (err) {
-    console.error("PATCH /equipe-obra/:id exception:", err);
-    return res.status(500).json({ ok: false, error: "Erro interno" });
-  }
-});
-
-// REMOVER (recomendado: inativar)
+// REMOVER (INATIVAR VÍNCULO)
+// DELETE /equipe-obra/:id
 app.delete("/equipe-obra/:id", requireAuth, async (req, res) => {
   try {
-    const id = req.params.id;
-    if (!isUuid(id))
-      return res.status(400).json({ ok: false, error: "id inválido" });
+    const id = String(req.params.id || "").trim();
+
+    if (!isUuid(id)) {
+      return res.status(400).json({ ok: false, error: "id inválido (UUID)" });
+    }
 
     const { error } = await supabaseAdmin
       .from("equipe_obra")
