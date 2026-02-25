@@ -512,6 +512,8 @@ app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
           dias: {},
           total_diaria: 0,
           total_empreita: 0,
+          total_reembolso: 0,
+          total_adiantamento: 0,
         });
       }
       return map.get(funcId);
@@ -548,17 +550,23 @@ app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
 
     const out = funcList.map((f) => {
       const agg = ensure(f.id);
+
+      const total_reembolso = Number(agg.total_reembolso || 0);
+      const total_adiantamento = Number(agg.total_adiantamento || 0);
+
       const total_pagar =
         Number(agg.total_diaria || 0) +
         Number(agg.total_empreita || 0) +
-        Number(agg.total_reembolso || 0) -
-        Number(agg.total_adiantamento || 0);
+        total_reembolso -
+        total_adiantamento;
 
       return {
         funcionario: f,
         dias: agg.dias,
         total_diaria: agg.total_diaria,
         total_empreita: agg.total_empreita,
+        total_reembolso,
+        total_adiantamento,
         total_pagar,
       };
     });
@@ -569,7 +577,16 @@ app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
     return res.status(500).json({ ok: false, error: "Erro interno" });
   }
 });
+// Ajustes (reembolso / adiantamento)
+for (const row of ajustesRows || []) {
+  const funcId = row.funcionario_id;
+  const reembolso = Number(row.reembolso ?? 0);
+  const adiantamento = Number(row.adiantamento ?? 0);
 
+  const obj = ensure(funcId);
+  obj.total_reembolso += Number.isFinite(reembolso) ? reembolso : 0;
+  obj.total_adiantamento += Number.isFinite(adiantamento) ? adiantamento : 0;
+}
 // ==================================================
 // FUNCIONÁRIOS (CRUD) - public.cadastro_func
 // (mantive seu campo "observaco" como estava no seu código)
