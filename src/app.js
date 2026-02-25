@@ -857,137 +857,24 @@ app.delete("/equipe-obra/:id", requireAuth, async (req, res) => {
     return res.status(500).json({ ok: false, error: "Erro interno" });
   }
 });
+
 // =====================================================
 // DIÁRIAS - SELECT + UPSERT (lanc_diarias)
+// - SEMPRE protegido (requireAuth)
 // =====================================================
 
-// GET /lanc-diarias?obra_id=UUID&data_ini=YYYY-MM-DD&data_fim=YYYY-MM-DD
-app.get("/lanc-diarias", async (req, res) => {
+// GET /lanc-diarias?obra_id=UUID&data_inicio=YYYY-MM-DD&data_fim=YYYY-MM-DD
+app.get("/lanc-diarias", requireAuth, async (req, res) => {
   try {
-    const { obra_id, data_ini, data_fim } = req.query;
+    const obra_id = String(req.query?.obra_id || "").trim();
+    const data_inicio = String(req.query?.data_inicio || "").trim();
+    const data_fim = String(req.query?.data_fim || "").trim();
 
-    if (!obra_id || !data_ini || !data_fim) {
-      return res
-        .status(400)
-        .json({ error: "obra_id, data_ini e data_fim são obrigatórios." });
-    }
-
-    const { data, error } = await supabase
-      .from("lanc_diarias")
-      .select("obra_id, funcionario_id, data, qtd, valor_diaria_aplicado")
-      .eq("obra_id", obra_id)
-      .gte("data", data_ini)
-      .lte("data", data_fim);
-
-    if (error) {
-      console.error("Erro GET /lanc-diarias:", error);
-      return res.status(500).json({ error: "Erro ao buscar diárias." });
-    }
-
-    return res.json({ data: data || [] });
-  } catch (e) {
-    console.error("Falha GET /lanc-diarias:", e);
-    return res.status(500).json({ error: "Erro interno." });
-  }
-});
-
-// POST /lanc-diarias  (upsert em lote)
-// Body: [{ obra_id, funcionario_id, data, qtd, valor_diaria_aplicado }]
-app.post("/lanc-diarias", async (req, res) => {
-  try {
-    const payload = req.body;
-    const rows = Array.isArray(payload) ? payload : [payload];
-
-    if (!rows.length) {
-      return res.status(400).json({ error: "Body vazio." });
-    }
-
-    const normalized = rows.map((r) => {
-      if (!r.obra_id || !r.funcionario_id || !r.data) {
-        throw new Error("obra_id, funcionario_id e data são obrigatórios.");
-      }
-      const qtd = Number(r.qtd);
-      const vda = Number(r.valor_diaria_aplicado);
-
-      if (!Number.isFinite(qtd)) throw new Error("qtd inválido.");
-      if (!Number.isFinite(vda) || vda <= 0)
-        throw new Error("valor_diaria_aplicado inválido.");
-
-      return {
-        obra_id: r.obra_id,
-        funcionario_id: r.funcionario_id,
-        data: r.data,
-        qtd,
-        valor_diaria_aplicado: vda,
-      };
-    });
-
-    // IMPORTANTE: precisa UNIQUE (obra_id, funcionario_id, data) no banco
-    const { data, error } = await supabase
-      .from("lanc_diarias")
-      .upsert(normalized, { onConflict: "obra_id,funcionario_id,data" })
-      .select("obra_id, funcionario_id, data, qtd, valor_diaria_aplicado");
-
-    if (error) {
-      console.error("Erro POST /lanc-diarias:", error);
-      return res.status(500).json({ error: "Erro ao salvar diárias." });
-    }
-
-    return res.json({ ok: true, data: data || [] });
-  } catch (e) {
-    console.error("Falha POST /lanc-diarias:", e);
-    return res
-      .status(400)
-      .json({ error: e.message || "Erro ao processar diárias." });
-  }
-});
-
-// =====================================================
-// AJUSTES DO PERÍODO (lanc_diarias_ajustes)
-// - guarda reembolso e adiantamento por obra + funcionário + data_inicio
-// =====================================================
-
-// GET /diarias-ajustes?obra_id=UUID&data_inicio=YYYY-MM-DD
-app.get("/diarias-ajustes", async (req, res) => {
-  try {
-    const { obra_id, data_inicio } = req.query;
-
-    if (!obra_id || !data_inicio) {
-      return res
-        .status(400)
-        .json({ error: "obra_id e data_inicio são obrigatórios." });
-    }
-
-    const { data, error } = await supabase
-      .from("lanc_diarias_ajustes")
-      .select("obra_id, funcionario_id, data_inicio, reembolso, adiantamento")
-      .eq("obra_id", obra_id)
-      .eq("data_inicio", data_inicio);
-
-    if (error) {
-      console.error("Erro GET /diarias-ajustes:", error);
-      return res
-        .status(500)
-        .json({ error: "Erro ao buscar ajustes do período." });
-    }
-
-    return res.json({ data: data || [] });
-  } catch (e) {
-    console.error("Falha GET /diarias-ajustes:", e);
-    return res.status(500).json({ error: "Erro interno." });
-  }
-});
-
-app.get("/lanc-diarias", authMiddleware, async (req, res) => {
-  try {
-    const { obra_id, data_inicio, data_fim } = req.query;
-
-    if (!obra_id || !data_inicio || !data_fim) {
-      return res
-        .status(400)
-        .json({
-          error: "Parâmetros obrigatórios: obra_id, data_inicio, data_fim",
-        });
+    if (!isUuid(obra_id) || !data_inicio || !data_fim) {
+      return res.status(400).json({
+        ok: false,
+        error: "Parâmetros obrigatórios: obra_id(UUID), data_inicio, data_fim",
+      });
     }
 
     const { data, error } = await supabaseAdmin
@@ -997,50 +884,89 @@ app.get("/lanc-diarias", authMiddleware, async (req, res) => {
       .gte("data", data_inicio)
       .lte("data", data_fim);
 
-    if (error) return res.status(400).json({ error: error.message });
-    return res.json({ data: data || [] });
+    if (error) {
+      console.error("GET /lanc-diarias error:", error);
+      return res
+        .status(500)
+        .json({ ok: false, error: "Erro ao buscar diárias" });
+    }
+
+    return res.json({ ok: true, data: data || [] });
   } catch (e) {
-    console.error("GET /lanc-diarias:", e);
-    return res.status(500).json({ error: "Erro interno." });
+    console.error("GET /lanc-diarias exception:", e);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
   }
 });
-app.post("/lanc-diarias", authMiddleware, async (req, res) => {
+
+// POST /lanc-diarias  (upsert em lote)
+// Body: { registros: [{ obra_id, funcionario_id, data, qtd, valor_diaria_aplicado }] }
+app.post("/lanc-diarias", requireAuth, async (req, res) => {
   try {
     const registros = req.body?.registros;
-
-    if (!Array.isArray(registros) || !registros.length) {
-      return res.status(400).json({ error: "Envie { registros: [...] }" });
+    if (!Array.isArray(registros) || registros.length === 0) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "Envie { registros: [...] }" });
     }
 
-    // valida mínimo
-    for (const r of registros) {
-      if (!r.obra_id || !r.funcionario_id || !r.data) {
-        return res
-          .status(400)
-          .json({ error: "Registro inválido (obra_id/funcionario_id/data)." });
+    const normalized = registros.map((r) => {
+      const obra_id = String(r.obra_id || "").trim();
+      const funcionario_id = String(r.funcionario_id || "").trim();
+      const data = String(r.data || "").trim();
+
+      if (!isUuid(obra_id) || !isUuid(funcionario_id) || !data) {
+        throw new Error(
+          "Registro inválido: obra_id/funcionario_id(UUID) e data são obrigatórios.",
+        );
       }
-    }
+
+      const qtd = Number(r.qtd);
+      const vda = Number(r.valor_diaria_aplicado);
+
+      if (!Number.isFinite(qtd)) throw new Error("qtd inválido.");
+      if (!Number.isFinite(vda) || vda <= 0)
+        throw new Error("valor_diaria_aplicado inválido.");
+
+      return { obra_id, funcionario_id, data, qtd, valor_diaria_aplicado: vda };
+    });
 
     const { error } = await supabaseAdmin
       .from("lanc_diarias")
-      .upsert(registros, { onConflict: "obra_id,funcionario_id,data" });
+      .upsert(normalized, { onConflict: "obra_id,funcionario_id,data" });
 
-    if (error) return res.status(400).json({ error: error.message });
+    if (error) {
+      console.error("POST /lanc-diarias error:", error);
+      return res
+        .status(500)
+        .json({ ok: false, error: "Erro ao salvar diárias" });
+    }
 
     return res.json({ ok: true });
   } catch (e) {
-    console.error("POST /lanc-diarias:", e);
-    return res.status(500).json({ error: "Erro interno." });
+    console.error("POST /lanc-diarias exception:", e);
+    return res
+      .status(400)
+      .json({ ok: false, error: e.message || "Erro ao processar diárias" });
   }
 });
-app.get("/diarias-ajustes", authMiddleware, async (req, res) => {
-  try {
-    const { obra_id, data_inicio } = req.query;
 
-    if (!obra_id || !data_inicio) {
-      return res
-        .status(400)
-        .json({ error: "Parâmetros obrigatórios: obra_id, data_inicio" });
+// =====================================================
+// AJUSTES DO PERÍODO (lanc_diarias_ajustes)
+// - guarda reembolso e adiantamento por obra + funcionário + data_inicio
+// - sugestão: usar CENTAVOS (inteiro) pra evitar vírgula/float
+// =====================================================
+
+// GET /diarias-ajustes?obra_id=UUID&data_inicio=YYYY-MM-DD
+app.get("/diarias-ajustes", requireAuth, async (req, res) => {
+  try {
+    const obra_id = String(req.query?.obra_id || "").trim();
+    const data_inicio = String(req.query?.data_inicio || "").trim();
+
+    if (!isUuid(obra_id) || !data_inicio) {
+      return res.status(400).json({
+        ok: false,
+        error: "Parâmetros obrigatórios: obra_id(UUID), data_inicio",
+      });
     }
 
     const { data, error } = await supabaseAdmin
@@ -1051,82 +977,81 @@ app.get("/diarias-ajustes", authMiddleware, async (req, res) => {
       .eq("obra_id", obra_id)
       .eq("data_inicio", data_inicio);
 
-    if (error) return res.status(400).json({ error: error.message });
-    return res.json({ data: data || [] });
+    if (error) {
+      console.error("GET /diarias-ajustes error:", error);
+      return res
+        .status(500)
+        .json({ ok: false, error: "Erro ao buscar ajustes" });
+    }
+
+    return res.json({ ok: true, data: data || [] });
   } catch (e) {
-    console.error("GET /diarias-ajustes:", e);
-    return res.status(500).json({ error: "Erro interno." });
+    console.error("GET /diarias-ajustes exception:", e);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
   }
 });
-app.post("/diarias-ajustes", authMiddleware, async (req, res) => {
+
+// POST /diarias-ajustes
+// Body: { ajustes: [{ obra_id, funcionario_id, data_inicio, reembolso_centavos, adiantamento_centavos }] }
+app.post("/diarias-ajustes", requireAuth, async (req, res) => {
   try {
     const ajustes = req.body?.ajustes;
-
     if (!Array.isArray(ajustes)) {
-      return res.status(400).json({ error: "Envie { ajustes: [...] }" });
+      return res
+        .status(400)
+        .json({ ok: false, error: "Envie { ajustes: [...] }" });
     }
 
-    // permite salvar 0/0 (pra “limpar”)
-    for (const a of ajustes) {
-      if (!a.obra_id || !a.funcionario_id || !a.data_inicio) {
-        return res
-          .status(400)
-          .json({
-            error: "Ajuste inválido (obra_id/funcionario_id/data_inicio).",
-          });
+    const normalized = ajustes.map((a) => {
+      const obra_id = String(a.obra_id || "").trim();
+      const funcionario_id = String(a.funcionario_id || "").trim();
+      const data_inicio = String(a.data_inicio || "").trim();
+
+      if (!isUuid(obra_id) || !isUuid(funcionario_id) || !data_inicio) {
+        throw new Error(
+          "Ajuste inválido: obra_id/funcionario_id(UUID) e data_inicio são obrigatórios.",
+        );
       }
-      a.reembolso_centavos = Number(a.reembolso_centavos || 0);
-      a.adiantamento_centavos = Number(a.adiantamento_centavos || 0);
-    }
+
+      const reembolso_centavos = Number(a.reembolso_centavos || 0);
+      const adiantamento_centavos = Number(a.adiantamento_centavos || 0);
+
+      if (!Number.isFinite(reembolso_centavos) || reembolso_centavos < 0) {
+        throw new Error("reembolso_centavos inválido.");
+      }
+      if (
+        !Number.isFinite(adiantamento_centavos) ||
+        adiantamento_centavos < 0
+      ) {
+        throw new Error("adiantamento_centavos inválido.");
+      }
+
+      return {
+        obra_id,
+        funcionario_id,
+        data_inicio,
+        reembolso_centavos,
+        adiantamento_centavos,
+      };
+    });
 
     const { error } = await supabaseAdmin
       .from("lanc_diarias_ajustes")
-      .upsert(ajustes, { onConflict: "obra_id,funcionario_id,data_inicio" });
+      .upsert(normalized, { onConflict: "obra_id,funcionario_id,data_inicio" });
 
-    if (error) return res.status(400).json({ error: error.message });
+    if (error) {
+      console.error("POST /diarias-ajustes error:", error);
+      return res
+        .status(500)
+        .json({ ok: false, error: "Erro ao salvar ajustes" });
+    }
 
     return res.json({ ok: true });
   } catch (e) {
-    console.error("POST /diarias-ajustes:", e);
-    return res.status(500).json({ error: "Erro interno." });
-  }
-});
-app.get("/funcionarios-vinculados", authMiddleware, async (req, res) => {
-  try {
-    // pega vínculos ativos + funcionario + obra (ativos) e diária > 0
-    const { data, error } = await supabaseAdmin
-      .from("equipe_obra")
-      .select(
-        `
-        obra_id,
-        funcionario_id,
-        valor_diaria,
-        situacao,
-        funcionario:cadastro_func ( id, nome, funcao, situacao ),
-        obra:cadastro_obra ( id, nome, situacao )
-      `,
-      )
-      .eq("situacao", "ativo");
-
-    if (error) return res.status(400).json({ error: error.message });
-
-    const rows = (data || [])
-      .filter((r) => r.funcionario && r.funcionario.situacao === "ativo")
-      .filter((r) => r.obra && r.obra.situacao === "ativo")
-      .filter((r) => r.valor_diaria != null && Number(r.valor_diaria) > 0)
-      .map((r) => ({
-        id: r.funcionario.id,
-        nome: r.funcionario.nome,
-        funcao: r.funcionario.funcao || null,
-        valor_diaria: Number(r.valor_diaria),
-        obra_id: r.obra_id,
-        obra_nome: r.obra?.nome || null,
-      }));
-
-    return res.json({ data: rows });
-  } catch (e) {
-    console.error("GET /funcionarios-vinculados:", e);
-    return res.status(500).json({ error: "Erro interno." });
+    console.error("POST /diarias-ajustes exception:", e);
+    return res
+      .status(400)
+      .json({ ok: false, error: e.message || "Erro ao processar ajustes" });
   }
 });
 // =====================================================
