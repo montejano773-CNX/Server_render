@@ -488,7 +488,22 @@ app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
         .status(500)
         .json({ ok: false, error: "Falha ao buscar empreitas" });
     }
+    // 3.5) Ajustes no período (lanc_diarias_ajustes)
+    // OBS: aqui usamos data_inicio como "data do lançamento do período"
+    const { data: ajustesRows, error: errAj } = await supabaseAdmin
+      .from("lanc_diarias_ajustes")
+      .select("funcionario_id, data_inicio, reembolso, adiantamento")
+      .in("funcionario_id", funcIds)
+      .gte("data_inicio", inicio)
+      .lte("data_inicio", fim);
 
+    if (errAj) {
+      console.error("GET /relatorios/pagamento ajustes error:", errAj);
+      return res.status(500).json({
+        ok: false,
+        error: "Falha ao buscar ajustes (reembolso/adiantamento)",
+      });
+    }
     const map = new Map();
 
     function ensure(funcId) {
@@ -534,7 +549,10 @@ app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
     const out = funcList.map((f) => {
       const agg = ensure(f.id);
       const total_pagar =
-        Number(agg.total_diaria || 0) + Number(agg.total_empreita || 0);
+        Number(agg.total_diaria || 0) +
+        Number(agg.total_empreita || 0) +
+        Number(agg.total_reembolso || 0) -
+        Number(agg.total_adiantamento || 0);
 
       return {
         funcionario: f,
