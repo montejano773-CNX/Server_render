@@ -590,7 +590,7 @@ app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
 });
 // ==================================================
 // FUNCIONÁRIOS (CRUD) - public.cadastro_func
-// (mantive seu campo "observaco" como estava no seu código)
+// (mantive seu campo "observacao" como estava no seu código)
 // ==================================================
 app.get("/funcionarios", requireAuth, async (req, res) => {
   try {
@@ -651,7 +651,7 @@ app.post("/funcionarios", requireAuth, async (req, res) => {
       agencia: req.body?.agencia?.trim?.() || null,
       conta: req.body?.conta?.trim?.() || null,
       chave_pix: req.body?.chave_pix?.trim?.() || null,
-      observaco: req.body?.observaco?.trim?.() || null,
+      observacao: req.body?.observacao?.trim?.() || null,
     };
 
     if (!payload.nome) {
@@ -728,10 +728,10 @@ app.patch("/funcionarios/:id", requireAuth, async (req, res) => {
               : null,
           }
         : {}),
-      ...(req.body?.observaco !== undefined
+      ...(req.body?.observacao !== undefined
         ? {
-            observaco: req.body.observaco
-              ? String(req.body.observaco).trim()
+            observacao: req.body.observacao
+              ? String(req.body.observacao).trim()
               : null,
           }
         : {}),
