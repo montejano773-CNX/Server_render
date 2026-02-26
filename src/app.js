@@ -968,7 +968,7 @@ app.post("/equipe-obra", requireAuth, async (req, res) => {
     } else {
       const { data: ins, error: insErr } = await supabaseAdmin
         .from("equipe_obra")
-        .insert({ obra_id, funcionario_id, valor_diaria, situacao, observacao })
+        .insert({ obra_id, funcionario_id, situacao, observacao })
         .select("id")
         .single();
 
