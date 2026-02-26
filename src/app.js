@@ -876,9 +876,7 @@ app.get("/equipe-obra", requireAuth, async (req, res) => {
 
     const { data, error } = await supabaseAdmin
       .from("equipe_obra")
-      .select(
-        "id, obra_id, funcionario_id, valor_diaria, situacao, observacao, created_at",
-      )
+      .select("id, obra_id, funcionario_id, situacao, observacao, created_at")
       .eq("obra_id", obraId)
       .order("created_at", { ascending: true });
 
