@@ -438,7 +438,10 @@ app.delete("/usuarios/:id", requireAuth, async (req, res) => {
 });
 
 // ==================================================
-// RELATÓRIOS (mantido igual ao seu)
+// RELATÓRIOS (NOVO - DADOS CRUS)
+// - NÃO faz soma aqui
+// - Front (rel_pagamento.html) monta e soma
+// - Rota usada pela tela: /relatorios/pagamento
 // ==================================================
 app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
   try {
@@ -452,6 +455,7 @@ app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
       });
     }
 
+    // 1) Funcionários (todos)
     const { data: funcionarios, error: errFunc } = await supabaseAdmin
       .from("cadastro_func")
       .select(
@@ -469,8 +473,18 @@ app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
     const funcList = funcionarios || [];
     const funcIds = funcList.map((f) => f.id);
 
-    if (funcIds.length === 0) return res.json({ ok: true, data: [] });
+    // Se não tiver funcionários, devolve vazio já no formato esperado
+    if (funcIds.length === 0) {
+      return res.json({
+        ok: true,
+        funcionarios: [],
+        diarias: [],
+        ajustes: [],
+        empreitas: [],
+      });
+    }
 
+    // 2) Diárias no período (dados crus)
     const { data: diarias, error: errDiarias } = await supabaseAdmin
       .from("lanc_diarias")
       .select("funcionario_id, data, qtd, valor_diaria_aplicado")
@@ -485,21 +499,8 @@ app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
         .json({ ok: false, error: "Falha ao buscar diárias" });
     }
 
-    const { data: empreitas, error: errEmp } = await supabaseAdmin
-      .from("empreitas")
-      .select("funcionario_id, data_pagamento, valor")
-      .in("funcionario_id", funcIds)
-      .gte("data_pagamento", inicio)
-      .lte("data_pagamento", fim);
-
-    if (errEmp) {
-      console.error("GET /relatorios/pagamento empreitas error:", errEmp);
-      return res
-        .status(500)
-        .json({ ok: false, error: "Falha ao buscar empreitas" });
-    }
-
-    const { data: ajustesRows, error: errAj } = await supabaseAdmin
+    // 3) Ajustes no período (dados crus)
+    const { data: ajustes, error: errAj } = await supabaseAdmin
       .from("lanc_diarias_ajustes")
       .select("funcionario_id, data_inicio, reembolso, adiantamento")
       .in("funcionario_id", funcIds)
@@ -514,84 +515,29 @@ app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
       });
     }
 
-    const map = new Map();
+    // 4) Empreitas no período (dados crus)
+    const { data: empreitas, error: errEmp } = await supabaseAdmin
+      .from("empreitas")
+      .select("funcionario_id, data_pagamento, valor")
+      .in("funcionario_id", funcIds)
+      .gte("data_pagamento", inicio)
+      .lte("data_pagamento", fim);
 
-    function ensure(funcId) {
-      if (!map.has(funcId)) {
-        map.set(funcId, {
-          dias: {},
-          total_diaria: 0,
-          total_empreita: 0,
-          total_reembolso: 0,
-          total_adiantamento: 0,
-        });
-      }
-      return map.get(funcId);
+    if (errEmp) {
+      console.error("GET /relatorios/pagamento empreitas error:", errEmp);
+      return res
+        .status(500)
+        .json({ ok: false, error: "Falha ao buscar empreitas" });
     }
 
-    for (const row of diarias || []) {
-      const funcId = row.funcionario_id;
-      const dia = row.data;
-      const qtd = Number(row.qtd ?? 1);
-      const v = Number(row.valor_diaria_aplicado ?? 0);
-      const valorDia =
-        (Number.isFinite(qtd) ? qtd : 1) * (Number.isFinite(v) ? v : 0);
-
-      const obj = ensure(funcId);
-      if (!obj.dias[dia]) obj.dias[dia] = { diaria: 0, empreita: 0 };
-
-      obj.dias[dia].diaria += valorDia;
-      obj.total_diaria += valorDia;
-    }
-
-    for (const row of empreitas || []) {
-      const funcId = row.funcionario_id;
-      const dia = row.data_pagamento;
-      const valor = Number(row.valor ?? 0);
-
-      const obj = ensure(funcId);
-      if (!obj.dias[dia]) obj.dias[dia] = { diaria: 0, empreita: 0 };
-
-      obj.dias[dia].empreita += valor;
-      obj.total_empreita += valor;
-    }
-
-    for (const row of ajustesRows || []) {
-      const funcId = row.funcionario_id;
-      const reembolso = Number(row.reembolso ?? 0);
-      const adiantamento = Number(row.adiantamento ?? 0);
-
-      const obj = ensure(funcId);
-      obj.total_reembolso += Number.isFinite(reembolso) ? reembolso : 0;
-      obj.total_adiantamento += Number.isFinite(adiantamento)
-        ? adiantamento
-        : 0;
-    }
-
-    const out = funcList.map((f) => {
-      const agg = ensure(f.id);
-
-      const total_reembolso = Number(agg.total_reembolso || 0);
-      const total_adiantamento = Number(agg.total_adiantamento || 0);
-
-      const total_pagar =
-        Number(agg.total_diaria || 0) +
-        Number(agg.total_empreita || 0) +
-        total_reembolso -
-        total_adiantamento;
-
-      return {
-        funcionario: f,
-        dias: agg.dias,
-        total_diaria: agg.total_diaria,
-        total_empreita: agg.total_empreita,
-        total_reembolso,
-        total_adiantamento,
-        total_pagar,
-      };
+    // ✅ Retorno exatamente no formato que o front espera
+    return res.json({
+      ok: true,
+      funcionarios: funcList,
+      diarias: diarias || [],
+      ajustes: ajustes || [],
+      empreitas: empreitas || [],
     });
-
-    return res.json({ ok: true, data: out });
   } catch (err) {
     console.error("GET /relatorios/pagamento exception:", err);
     return res.status(500).json({ ok: false, error: "Erro interno" });
