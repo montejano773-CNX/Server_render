@@ -47,7 +47,17 @@ function isUuid(v) {
     String(v).trim(),
   );
 }
+function normValorDiaria(v) {
+  // aceita: null/undefined/""
+  if (v === undefined || v === null || v === "") return null;
 
+  // aceita string com vírgula (ex: "200,50")
+  const s = String(v).trim().replace(",", ".");
+  const n = Number(s);
+
+  if (!Number.isFinite(n) || n < 0) return NaN;
+  return n;
+}
 function normSituacao(v, fallback = "ativo") {
   const s = String(v || fallback)
     .toLowerCase()
@@ -612,7 +622,71 @@ app.get("/funcionarios", requireAuth, async (req, res) => {
     return res.status(500).json({ ok: false, error: "Erro interno" });
   }
 });
+// ==================================================
+// ATUALIZAR FUNCIONÁRIO (PUT /funcionarios/:id)
+// - pensado para a tela editar (envia o "form completo")
+// - inclui valor_diaria
+// ==================================================
+app.put("/funcionarios/:id", requireAuth, async (req, res) => {
+  try {
+    const id = req.params.id;
 
+    // nome é obrigatório no PUT (seu form exige)
+    const nome = String(req.body?.nome || "").trim();
+    if (!nome) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "Informe o nome do funcionário" });
+    }
+
+    // ✅ valor_diaria (numeric >= 0) ou null
+    const vdi = normValorDiaria(req.body?.valor_diaria);
+    if (Number.isNaN(vdi)) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "valor_diaria inválido" });
+    }
+
+    const payload = {
+      nome,
+      apelido: req.body?.apelido ? String(req.body.apelido).trim() : null,
+      funcao: req.body?.funcao ? String(req.body.funcao).trim() : null,
+      valor_diaria: vdi,
+      cpf: req.body?.cpf ? String(req.body.cpf).replace(/\D/g, "") : null,
+      situacao: normSituacao(req.body?.situacao, "ativo"),
+      razao_social: req.body?.razao_social
+        ? String(req.body.razao_social).trim()
+        : null,
+      titular_conta: req.body?.titular_conta
+        ? String(req.body.titular_conta).trim()
+        : null,
+      banco: req.body?.banco ? String(req.body.banco).trim() : null,
+      agencia: req.body?.agencia ? String(req.body.agencia).trim() : null,
+      conta: req.body?.conta ? String(req.body.conta).trim() : null,
+      chave_pix: req.body?.chave_pix ? String(req.body.chave_pix).trim() : null,
+      observacao: req.body?.observacao
+        ? String(req.body.observacao).trim()
+        : null,
+    };
+
+    const { error } = await supabaseAdmin
+      .from("cadastro_func")
+      .update(payload)
+      .eq("id", id);
+
+    if (error) {
+      console.error("PUT /funcionarios/:id error:", error);
+      return res
+        .status(500)
+        .json({ ok: false, error: "Falha ao atualizar funcionário" });
+    }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("PUT /funcionarios/:id exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
 app.get("/funcionarios/:id", requireAuth, async (req, res) => {
   try {
     const id = req.params.id;
