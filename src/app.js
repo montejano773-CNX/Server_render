@@ -47,6 +47,7 @@ function isUuid(v) {
     String(v).trim(),
   );
 }
+
 function normValorDiaria(v) {
   // aceita: null/undefined/""
   if (v === undefined || v === null || v === "") return null;
@@ -58,6 +59,7 @@ function normValorDiaria(v) {
   if (!Number.isFinite(n) || n < 0) return NaN;
   return n;
 }
+
 function normSituacao(v, fallback = "ativo") {
   const s = String(v || fallback)
     .toLowerCase()
@@ -67,6 +69,7 @@ function normSituacao(v, fallback = "ativo") {
 
 // --------------------------------------------------
 // Enriquecimento manual (sem depender de FK)
+// ✅ Agora também traz valor_diaria do cadastro_func
 // --------------------------------------------------
 async function enrichEquipeRowsWithNames(rows) {
   const out = rows || [];
@@ -79,12 +82,15 @@ async function enrichEquipeRowsWithNames(rows) {
       ...r,
       funcionario_nome: null,
       funcionario_funcao: null,
+      funcionario_valor_diaria: 0,
+      // compat p/ front antigo:
+      valor_diaria: 0,
     }));
   }
 
   const { data: funcs, error: errF } = await supabaseAdmin
     .from("cadastro_func")
-    .select("id, nome, funcao, situacao")
+    .select("id, nome, funcao, situacao, valor_diaria")
     .in("id", funcIds);
 
   if (errF) {
@@ -93,17 +99,25 @@ async function enrichEquipeRowsWithNames(rows) {
       ...r,
       funcionario_nome: null,
       funcionario_funcao: null,
+      funcionario_valor_diaria: 0,
+      valor_diaria: 0,
     }));
   }
 
   const map = {};
   (funcs || []).forEach((f) => (map[f.id] = f));
 
-  return out.map((r) => ({
-    ...r,
-    funcionario_nome: map[r.funcionario_id]?.nome || null,
-    funcionario_funcao: map[r.funcionario_id]?.funcao || null,
-  }));
+  return out.map((r) => {
+    const vd = Number(map[r.funcionario_id]?.valor_diaria || 0);
+    return {
+      ...r,
+      funcionario_nome: map[r.funcionario_id]?.nome || null,
+      funcionario_funcao: map[r.funcionario_id]?.funcao || null,
+      funcionario_valor_diaria: vd,
+      // ✅ compat p/ telas que ainda usam row.valor_diaria
+      valor_diaria: vd,
+    };
+  });
 }
 
 async function enrichEquipeRowsWithObraNames(rows) {
@@ -150,8 +164,7 @@ app.get("/health", (req, res) => {
 });
 
 // ==================================================
-// /me (perfil completo)
-// ✅ CORRIGIDO: usa id = auth.id (seu cadastro_user usa o uuid do Auth como id)
+// /me
 // ==================================================
 app.get("/me", requireAuth, async (req, res) => {
   try {
@@ -178,10 +191,8 @@ app.get("/me", requireAuth, async (req, res) => {
 });
 
 // ==================================================
-// USUÁRIOS (CRUD) - public.cadastro_user
+// USUÁRIOS (CRUD) - (mantido igual ao seu)
 // ==================================================
-
-// LISTAR
 app.get("/usuarios", requireAuth, async (req, res) => {
   try {
     const { data, error } = await supabaseAdmin
@@ -203,7 +214,6 @@ app.get("/usuarios", requireAuth, async (req, res) => {
   }
 });
 
-// BUSCAR POR ID
 app.get("/usuarios/:id", requireAuth, async (req, res) => {
   try {
     const id = req.params.id;
@@ -228,7 +238,6 @@ app.get("/usuarios/:id", requireAuth, async (req, res) => {
   }
 });
 
-// CRIAR (Auth + cadastro_user)
 app.post("/usuarios", requireAuth, async (req, res) => {
   try {
     const nome = (req.body?.nome || "").trim();
@@ -253,7 +262,6 @@ app.post("/usuarios", requireAuth, async (req, res) => {
       });
     }
 
-    // 1) cria no Auth
     const { data: created, error: createErr } =
       await supabaseAdmin.auth.admin.createUser({
         email,
@@ -276,7 +284,6 @@ app.post("/usuarios", requireAuth, async (req, res) => {
         .json({ ok: false, error: "Falha ao criar usuário no Auth" });
     }
 
-    // 2) grava no cadastro_user (id = auth uuid)
     const row = {
       id: newAuthId,
       nome,
@@ -293,7 +300,6 @@ app.post("/usuarios", requireAuth, async (req, res) => {
     if (insertErr) {
       console.error("POST /usuarios insert cadastro_user error:", insertErr);
 
-      // rollback
       try {
         await supabaseAdmin.auth.admin.deleteUser(newAuthId);
       } catch (e) {
@@ -312,7 +318,6 @@ app.post("/usuarios", requireAuth, async (req, res) => {
   }
 });
 
-// EDITAR (PATCH)
 app.patch("/usuarios/:id", requireAuth, async (req, res) => {
   try {
     const id = req.params.id;
@@ -396,7 +401,6 @@ app.patch("/usuarios/:id", requireAuth, async (req, res) => {
   }
 });
 
-// DELETAR
 app.delete("/usuarios/:id", requireAuth, async (req, res) => {
   try {
     const id = req.params.id;
@@ -434,8 +438,7 @@ app.delete("/usuarios/:id", requireAuth, async (req, res) => {
 });
 
 // ==================================================
-// RELATÓRIOS
-// GET /relatorios/pagamento?inicio=YYYY-MM-DD&fim=YYYY-MM-DD
+// RELATÓRIOS (mantido igual ao seu)
 // ==================================================
 app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
   try {
@@ -449,7 +452,6 @@ app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
       });
     }
 
-    // 1) Funcionários
     const { data: funcionarios, error: errFunc } = await supabaseAdmin
       .from("cadastro_func")
       .select(
@@ -469,7 +471,6 @@ app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
 
     if (funcIds.length === 0) return res.json({ ok: true, data: [] });
 
-    // 2) Diárias no período (lanc_diarias)
     const { data: diarias, error: errDiarias } = await supabaseAdmin
       .from("lanc_diarias")
       .select("funcionario_id, data, qtd, valor_diaria_aplicado")
@@ -484,7 +485,6 @@ app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
         .json({ ok: false, error: "Falha ao buscar diárias" });
     }
 
-    // 3) Empreitas no período (empreitas)
     const { data: empreitas, error: errEmp } = await supabaseAdmin
       .from("empreitas")
       .select("funcionario_id, data_pagamento, valor")
@@ -498,8 +498,7 @@ app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
         .status(500)
         .json({ ok: false, error: "Falha ao buscar empreitas" });
     }
-    // 3.5) Ajustes no período (lanc_diarias_ajustes)
-    // OBS: aqui usamos data_inicio como "data do lançamento do período"
+
     const { data: ajustesRows, error: errAj } = await supabaseAdmin
       .from("lanc_diarias_ajustes")
       .select("funcionario_id, data_inicio, reembolso, adiantamento")
@@ -514,6 +513,7 @@ app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
         error: "Falha ao buscar ajustes (reembolso/adiantamento)",
       });
     }
+
     const map = new Map();
 
     function ensure(funcId) {
@@ -529,7 +529,6 @@ app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
       return map.get(funcId);
     }
 
-    // Diárias
     for (const row of diarias || []) {
       const funcId = row.funcionario_id;
       const dia = row.data;
@@ -545,7 +544,6 @@ app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
       obj.total_diaria += valorDia;
     }
 
-    // Empreitas
     for (const row of empreitas || []) {
       const funcId = row.funcionario_id;
       const dia = row.data_pagamento;
@@ -557,7 +555,7 @@ app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
       obj.dias[dia].empreita += valor;
       obj.total_empreita += valor;
     }
-    // Ajustes (reembolso / adiantamento)
+
     for (const row of ajustesRows || []) {
       const funcId = row.funcionario_id;
       const reembolso = Number(row.reembolso ?? 0);
@@ -569,6 +567,7 @@ app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
         ? adiantamento
         : 0;
     }
+
     const out = funcList.map((f) => {
       const agg = ensure(f.id);
 
@@ -598,15 +597,16 @@ app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
     return res.status(500).json({ ok: false, error: "Erro interno" });
   }
 });
+
 // ==================================================
 // FUNCIONÁRIOS (CRUD) - public.cadastro_func
-// (mantive seu campo "observacao" como estava no seu código)
+// ✅ Deixei seu CRUD igual, só mantive valor_diaria no PUT (como você já tinha)
 // ==================================================
 app.get("/funcionarios", requireAuth, async (req, res) => {
   try {
     const { data, error } = await supabaseAdmin
       .from("cadastro_func")
-      .select("id, nome, apelido, funcao, cpf, situacao")
+      .select("id, nome, apelido, funcao, cpf, situacao, valor_diaria")
       .order("nome", { ascending: true });
 
     if (error) {
@@ -622,16 +622,11 @@ app.get("/funcionarios", requireAuth, async (req, res) => {
     return res.status(500).json({ ok: false, error: "Erro interno" });
   }
 });
-// ==================================================
-// ATUALIZAR FUNCIONÁRIO (PUT /funcionarios/:id)
-// - pensado para a tela editar (envia o "form completo")
-// - inclui valor_diaria
-// ==================================================
+
 app.put("/funcionarios/:id", requireAuth, async (req, res) => {
   try {
     const id = req.params.id;
 
-    // nome é obrigatório no PUT (seu form exige)
     const nome = String(req.body?.nome || "").trim();
     if (!nome) {
       return res
@@ -639,7 +634,6 @@ app.put("/funcionarios/:id", requireAuth, async (req, res) => {
         .json({ ok: false, error: "Informe o nome do funcionário" });
     }
 
-    // ✅ valor_diaria (numeric >= 0) ou null
     const vdi = normValorDiaria(req.body?.valor_diaria);
     if (Number.isNaN(vdi)) {
       return res
@@ -687,6 +681,7 @@ app.put("/funcionarios/:id", requireAuth, async (req, res) => {
     return res.status(500).json({ ok: false, error: "Erro interno" });
   }
 });
+
 app.get("/funcionarios/:id", requireAuth, async (req, res) => {
   try {
     const id = req.params.id;
@@ -859,10 +854,10 @@ app.delete("/funcionarios/:id", requireAuth, async (req, res) => {
 
 // ==================================================
 // EQUIPE POR OBRA (CRUD) - public.equipe_obra
+// ✅ SEM valor_diaria em equipe_obra
 // ==================================================
 
 // LISTAR EQUIPE DA OBRA
-// ✅ CORRIGIDO: agora devolve funcionario_nome / funcionario_funcao também
 app.get("/equipe-obra", requireAuth, async (req, res) => {
   try {
     const obraId = String(req.query?.obra_id || "").trim();
@@ -896,6 +891,7 @@ app.get("/equipe-obra", requireAuth, async (req, res) => {
 });
 
 // ADICIONAR / ATUALIZAR (UPSERT MANUAL)
+// ✅ SEM valor_diaria
 app.post("/equipe-obra", requireAuth, async (req, res) => {
   try {
     const obra_id = String(req.body?.obra_id || "").trim();
@@ -910,21 +906,6 @@ app.post("/equipe-obra", requireAuth, async (req, res) => {
       return res
         .status(400)
         .json({ ok: false, error: "funcionario_id inválido (UUID)" });
-    }
-
-    let valor_diaria = null;
-    if (
-      req.body?.valor_diaria !== undefined &&
-      req.body?.valor_diaria !== null &&
-      req.body?.valor_diaria !== ""
-    ) {
-      const n = Number(req.body.valor_diaria);
-      if (Number.isNaN(n) || n < 0) {
-        return res
-          .status(400)
-          .json({ ok: false, error: "valor_diaria inválido" });
-      }
-      valor_diaria = n;
     }
 
     const situacao = normSituacao(req.body?.situacao, "ativo");
@@ -1015,6 +996,7 @@ app.delete("/equipe-obra/:id", requireAuth, async (req, res) => {
 
 // =====================================================
 // DIÁRIAS - SELECT + UPSERT (lanc_diarias)
+// (mantido igual ao seu)
 // =====================================================
 app.get("/lanc-diarias", requireAuth, async (req, res) => {
   try {
@@ -1101,11 +1083,8 @@ app.post("/lanc-diarias", requireAuth, async (req, res) => {
 });
 
 // =====================================================
-// AJUSTES DO PERÍODO (lanc_diarias_ajustes)
-// ✅ SEU SCHEMA REAL: reembolso numeric, adiantamento numeric
-// ✅ COMPAT: aceita também reembolso_centavos/adiantamento_centavos e converte
+// AJUSTES DO PERÍODO (lanc_diarias_ajustes) (mantido igual)
 // =====================================================
-
 app.get("/diarias-ajustes", requireAuth, async (req, res) => {
   try {
     const obra_id = String(req.query?.obra_id || "").trim();
@@ -1120,7 +1099,9 @@ app.get("/diarias-ajustes", requireAuth, async (req, res) => {
 
     const { data, error } = await supabaseAdmin
       .from("lanc_diarias_ajustes")
-      .select("obra_id, funcionario_id, data_inicio, reembolso, adiantamento")
+      .select(
+        "obra_id, funcionario_id, data_inicio, reembolso, adiantamento, valor",
+      )
       .eq("obra_id", obra_id)
       .eq("data_inicio", data_inicio);
 
@@ -1158,7 +1139,6 @@ app.post("/diarias-ajustes", requireAuth, async (req, res) => {
         );
       }
 
-      // centavos do front
       const reembolso_centavos = Number(a.reembolso_centavos ?? 0);
       const adiantamento_centavos = Number(a.adiantamento_centavos ?? 0);
 
@@ -1172,11 +1152,9 @@ app.post("/diarias-ajustes", requireAuth, async (req, res) => {
         throw new Error("adiantamento_centavos inválido.");
       }
 
-      // ✅ banco: numeric (reais)
       const reembolso = reembolso_centavos / 100;
       const adiantamento = adiantamento_centavos / 100;
 
-      // ✅ valor da diária snapshot (numeric)
       const valor = Number(a.valor ?? 0);
       if (!Number.isFinite(valor) || valor < 0) {
         throw new Error("valor (diária) inválido.");
@@ -1188,7 +1166,7 @@ app.post("/diarias-ajustes", requireAuth, async (req, res) => {
         data_inicio,
         reembolso,
         adiantamento,
-        valor, // ✅ salva a diária do período
+        valor,
       };
     });
 
@@ -1213,15 +1191,14 @@ app.post("/diarias-ajustes", requireAuth, async (req, res) => {
 });
 
 // =====================================================
-// ✅ NOVA ROTA: FUNCIONÁRIOS VINCULADOS (para extras no diarias.html)
-// Formato que o front espera:
-// { id, nome, funcao, valor_diaria, obra_id, obra_nome, situacao }
+// ✅ FUNCIONÁRIOS VINCULADOS (para extras no diarias.html)
+// ✅ NÃO usa equipe_obra.valor_diaria (não existe)
 // =====================================================
 app.get("/funcionarios-vinculados", requireAuth, async (req, res) => {
   try {
     const { data, error } = await supabaseAdmin
       .from("equipe_obra")
-      .select("obra_id, funcionario_id, valor_diaria, situacao");
+      .select("obra_id, funcionario_id, situacao");
 
     if (error) {
       console.error("GET /funcionarios-vinculados error:", error);
@@ -1237,7 +1214,8 @@ app.get("/funcionarios-vinculados", requireAuth, async (req, res) => {
       id: r.funcionario_id,
       nome: r.funcionario_nome,
       funcao: r.funcionario_funcao,
-      valor_diaria: r.valor_diaria,
+      // ✅ diária vem do cadastro_func via enrich
+      valor_diaria: Number(r.funcionario_valor_diaria || r.valor_diaria || 0),
       obra_id: r.obra_id,
       obra_nome: r.obra_nome,
       situacao: r.situacao,
@@ -1251,15 +1229,14 @@ app.get("/funcionarios-vinculados", requireAuth, async (req, res) => {
 });
 
 // =====================================================
-// ✅ /equipe-obra/todas (CORRIGIDA)
-// - antes estava quebrando por usar "supabase" inexistente
-// - agora usa supabaseAdmin + requireAuth
+// ✅ /equipe-obra/todas (se você usa em algum lugar)
+// ✅ NÃO usa equipe_obra.valor_diaria
 // =====================================================
 app.get("/equipe-obra/todas", requireAuth, async (req, res) => {
   try {
     const { data, error } = await supabaseAdmin
       .from("equipe_obra")
-      .select("obra_id, funcionario_id, valor_diaria, situacao");
+      .select("obra_id, funcionario_id, situacao");
 
     if (error) {
       console.error("Erro GET /equipe-obra/todas:", error);
@@ -1274,12 +1251,16 @@ app.get("/equipe-obra/todas", requireAuth, async (req, res) => {
     const enriched = (withObras || []).map((r) => ({
       obra_id: r.obra_id,
       funcionario_id: r.funcionario_id,
-      valor_diaria: r.valor_diaria,
       situacao: r.situacao,
+
       obra_nome: r.obra_nome || null,
       obra_situacao: r.obra_situacao || null,
+
       funcionario_nome: r.funcionario_nome || null,
       funcionario_funcao: r.funcionario_funcao || null,
+
+      // ✅ diária vem do cadastro_func
+      valor_diaria: Number(r.funcionario_valor_diaria || r.valor_diaria || 0),
     }));
 
     return res.json({ ok: true, data: enriched });
@@ -1290,7 +1271,7 @@ app.get("/equipe-obra/todas", requireAuth, async (req, res) => {
 });
 
 // ==================================================
-// EMPREITAS (CRUD) - public.empreitas
+// EMPREITAS (CRUD) - (mantido igual ao seu)
 // ==================================================
 app.get("/empreitas", requireAuth, async (req, res) => {
   try {
@@ -1341,6 +1322,7 @@ app.get("/empreitas", requireAuth, async (req, res) => {
   }
 });
 
+// (resto empreitas CRUD igual ao seu...)
 app.get("/empreitas/:id", requireAuth, async (req, res) => {
   try {
     const id = req.params.id;
@@ -1426,97 +1408,9 @@ app.post("/empreitas", requireAuth, async (req, res) => {
   }
 });
 
-app.patch("/empreitas/:id", requireAuth, async (req, res) => {
-  try {
-    const id = req.params.id;
-
-    const patch = {
-      ...(req.body?.obra_id !== undefined
-        ? (() => {
-            if (!isUuid(req.body.obra_id))
-              throw new Error("obra_id inválido (UUID)");
-            return { obra_id: req.body.obra_id };
-          })()
-        : {}),
-      ...(req.body?.funcionario_id !== undefined
-        ? (() => {
-            if (!isUuid(req.body.funcionario_id))
-              throw new Error("funcionario_id inválido (UUID)");
-            return { funcionario_id: req.body.funcionario_id };
-          })()
-        : {}),
-      ...(req.body?.data_pagamento !== undefined
-        ? { data_pagamento: String(req.body.data_pagamento) }
-        : {}),
-      ...(req.body?.valor !== undefined
-        ? (() => {
-            const v = Number(req.body.valor);
-            if (!Number.isFinite(v) || v < 0) throw new Error("valor inválido");
-            return { valor: v };
-          })()
-        : {}),
-      ...(req.body?.descricao !== undefined
-        ? {
-            descricao: req.body.descricao
-              ? String(req.body.descricao).trim()
-              : null,
-          }
-        : {}),
-    };
-
-    if (Object.keys(patch).length === 0) {
-      return res.status(400).json({ ok: false, error: "Nada para atualizar" });
-    }
-
-    const { error } = await supabaseAdmin
-      .from("empreitas")
-      .update(patch)
-      .eq("id", id);
-
-    if (error) {
-      console.error("PATCH /empreitas/:id error:", error);
-      return res
-        .status(500)
-        .json({ ok: false, error: "Falha ao atualizar empreita" });
-    }
-
-    return res.json({ ok: true });
-  } catch (err) {
-    const msg = String(err?.message || "");
-    if (msg.includes("inválido"))
-      return res.status(400).json({ ok: false, error: msg });
-    console.error("PATCH /empreitas/:id exception:", err);
-    return res.status(500).json({ ok: false, error: "Erro interno" });
-  }
-});
-
-app.delete("/empreitas/:id", requireAuth, async (req, res) => {
-  try {
-    const id = req.params.id;
-
-    const { error } = await supabaseAdmin
-      .from("empreitas")
-      .delete()
-      .eq("id", id);
-
-    if (error) {
-      console.error("DELETE /empreitas/:id error:", error);
-      return res
-        .status(500)
-        .json({ ok: false, error: "Falha ao deletar empreita" });
-    }
-
-    return res.json({ ok: true });
-  } catch (err) {
-    console.error("DELETE /empreitas/:id exception:", err);
-    return res.status(500).json({ ok: false, error: "Erro interno" });
-  }
-});
-
 // ==================================================
-// OBRAS (CRUD) - public.cadastro_obra
+// OBRAS (CRUD) - (mantido igual ao seu)
 // ==================================================
-
 app.get("/obras", requireAuth, async (req, res) => {
   try {
     const authId = req.authUser.id;
@@ -1558,303 +1452,6 @@ app.get("/obras/todas", requireAuth, async (req, res) => {
     return res.json({ ok: true, data: data || [] });
   } catch (err) {
     console.error("GET /obras/todas exception:", err);
-    return res.status(500).json({ ok: false, error: "Erro interno" });
-  }
-});
-
-app.get("/obras/:id", requireAuth, async (req, res) => {
-  try {
-    const authId = req.authUser.id;
-    const id = req.params.id;
-
-    const { data, error } = await supabaseAdmin
-      .from("cadastro_obra")
-      .select("*")
-      .eq("id", id)
-      .eq("responsavel", authId)
-      .single();
-
-    if (error) {
-      console.error("GET /obras/:id error:", error);
-      return res.status(404).json({ ok: false, error: "Obra não encontrada" });
-    }
-
-    return res.json({ ok: true, data });
-  } catch (err) {
-    console.error("GET /obras/:id exception:", err);
-    return res.status(500).json({ ok: false, error: "Erro interno" });
-  }
-});
-
-app.get("/obras/admin/:id", requireAuth, async (req, res) => {
-  try {
-    const id = req.params.id;
-
-    const { data, error } = await supabaseAdmin
-      .from("cadastro_obra")
-      .select("*")
-      .eq("id", id)
-      .single();
-
-    if (error) {
-      console.error("GET /obras/admin/:id error:", error);
-      return res.status(404).json({ ok: false, error: "Obra não encontrada" });
-    }
-
-    return res.json({ ok: true, data });
-  } catch (err) {
-    console.error("GET /obras/admin/:id exception:", err);
-    return res.status(500).json({ ok: false, error: "Erro interno" });
-  }
-});
-
-app.post("/obras", requireAuth, async (req, res) => {
-  try {
-    const authId = req.authUser.id;
-
-    const payload = {
-      nome: (req.body?.nome || "").trim(),
-      cidade: req.body?.cidade?.trim?.() || null,
-      uf: req.body?.uf || null,
-      situacao: normSituacao(req.body?.situacao, "ativo"),
-      responsavel: authId,
-      endereco: req.body?.endereco?.trim?.() || null,
-      observacao: req.body?.observacao?.trim?.() || null,
-    };
-
-    if (!payload.nome) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "Informe o nome da obra" });
-    }
-
-    const { data, error } = await supabaseAdmin
-      .from("cadastro_obra")
-      .insert(payload)
-      .select("id")
-      .single();
-
-    if (error) {
-      console.error("POST /obras error:", error);
-      return res.status(500).json({ ok: false, error: "Falha ao salvar obra" });
-    }
-
-    return res.status(201).json({ ok: true, data });
-  } catch (err) {
-    console.error("POST /obras exception:", err);
-    return res.status(500).json({ ok: false, error: "Erro interno" });
-  }
-});
-
-app.post("/obras/admin", requireAuth, async (req, res) => {
-  try {
-    const responsavel = req.body?.responsavel;
-
-    if (!isUuid(responsavel)) {
-      return res.status(400).json({
-        ok: false,
-        error: "Responsável inválido (precisa ser auth_user_id UUID)",
-      });
-    }
-
-    const payload = {
-      nome: (req.body?.nome || "").trim(),
-      cidade: req.body?.cidade?.trim?.() || null,
-      uf: req.body?.uf || null,
-      situacao: normSituacao(req.body?.situacao, "ativo"),
-      responsavel,
-      endereco: req.body?.endereco?.trim?.() || null,
-      observacao: req.body?.observacao?.trim?.() || null,
-    };
-
-    if (!payload.nome) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "Informe o nome da obra" });
-    }
-
-    const { data, error } = await supabaseAdmin
-      .from("cadastro_obra")
-      .insert(payload)
-      .select("id")
-      .single();
-
-    if (error) {
-      console.error("POST /obras/admin error:", error);
-      return res.status(500).json({ ok: false, error: "Falha ao salvar obra" });
-    }
-
-    return res.status(201).json({ ok: true, data });
-  } catch (err) {
-    console.error("POST /obras/admin exception:", err);
-    return res.status(500).json({ ok: false, error: "Erro interno" });
-  }
-});
-
-app.patch("/obras/:id", requireAuth, async (req, res) => {
-  try {
-    const authId = req.authUser.id;
-    const id = req.params.id;
-
-    const patch = {
-      ...(req.body?.nome !== undefined
-        ? { nome: String(req.body.nome).trim() }
-        : {}),
-      ...(req.body?.cidade !== undefined
-        ? { cidade: req.body.cidade ? String(req.body.cidade).trim() : null }
-        : {}),
-      ...(req.body?.uf !== undefined ? { uf: req.body.uf || null } : {}),
-      ...(req.body?.situacao !== undefined
-        ? { situacao: normSituacao(req.body.situacao) }
-        : {}),
-      ...(req.body?.endereco !== undefined
-        ? {
-            endereco: req.body.endereco
-              ? String(req.body.endereco).trim()
-              : null,
-          }
-        : {}),
-      ...(req.body?.observacao !== undefined
-        ? {
-            observacao: req.body.observacao
-              ? String(req.body.observacao).trim()
-              : null,
-          }
-        : {}),
-    };
-
-    if (Object.keys(patch).length === 0) {
-      return res.status(400).json({ ok: false, error: "Nada para atualizar" });
-    }
-
-    const { error } = await supabaseAdmin
-      .from("cadastro_obra")
-      .update(patch)
-      .eq("id", id)
-      .eq("responsavel", authId);
-
-    if (error) {
-      console.error("PATCH /obras/:id error:", error);
-      return res
-        .status(500)
-        .json({ ok: false, error: "Falha ao atualizar obra" });
-    }
-
-    return res.json({ ok: true });
-  } catch (err) {
-    console.error("PATCH /obras/:id exception:", err);
-    return res.status(500).json({ ok: false, error: "Erro interno" });
-  }
-});
-
-app.patch("/obras/admin/:id", requireAuth, async (req, res) => {
-  try {
-    const id = req.params.id;
-
-    const patch = {
-      ...(req.body?.nome !== undefined
-        ? { nome: String(req.body.nome).trim() }
-        : {}),
-      ...(req.body?.cidade !== undefined
-        ? { cidade: req.body.cidade ? String(req.body.cidade).trim() : null }
-        : {}),
-      ...(req.body?.uf !== undefined ? { uf: req.body.uf || null } : {}),
-      ...(req.body?.situacao !== undefined
-        ? { situacao: normSituacao(req.body.situacao) }
-        : {}),
-      ...(req.body?.endereco !== undefined
-        ? {
-            endereco: req.body.endereco
-              ? String(req.body.endereco).trim()
-              : null,
-          }
-        : {}),
-      ...(req.body?.observacao !== undefined
-        ? {
-            observacao: req.body.observacao
-              ? String(req.body.observacao).trim()
-              : null,
-          }
-        : {}),
-    };
-
-    if (req.body?.responsavel !== undefined) {
-      if (!isUuid(req.body.responsavel)) {
-        return res.status(400).json({
-          ok: false,
-          error: "Responsável inválido (precisa ser auth_user_id UUID)",
-        });
-      }
-      patch.responsavel = req.body.responsavel;
-    }
-
-    if (Object.keys(patch).length === 0) {
-      return res.status(400).json({ ok: false, error: "Nada para atualizar" });
-    }
-
-    const { error } = await supabaseAdmin
-      .from("cadastro_obra")
-      .update(patch)
-      .eq("id", id);
-
-    if (error) {
-      console.error("PATCH /obras/admin/:id error:", error);
-      return res
-        .status(500)
-        .json({ ok: false, error: "Falha ao atualizar obra (admin)" });
-    }
-
-    return res.json({ ok: true });
-  } catch (err) {
-    console.error("PATCH /obras/admin/:id exception:", err);
-    return res.status(500).json({ ok: false, error: "Erro interno" });
-  }
-});
-
-app.delete("/obras/:id", requireAuth, async (req, res) => {
-  try {
-    const authId = req.authUser.id;
-    const id = req.params.id;
-
-    const { error } = await supabaseAdmin
-      .from("cadastro_obra")
-      .delete()
-      .eq("id", id)
-      .eq("responsavel", authId);
-
-    if (error) {
-      console.error("DELETE /obras/:id error:", error);
-      return res
-        .status(500)
-        .json({ ok: false, error: "Falha ao deletar obra" });
-    }
-
-    return res.json({ ok: true });
-  } catch (err) {
-    console.error("DELETE /obras/:id exception:", err);
-    return res.status(500).json({ ok: false, error: "Erro interno" });
-  }
-});
-
-app.delete("/obras/admin/:id", requireAuth, async (req, res) => {
-  try {
-    const id = req.params.id;
-
-    const { error } = await supabaseAdmin
-      .from("cadastro_obra")
-      .delete()
-      .eq("id", id);
-
-    if (error) {
-      console.error("DELETE /obras/admin/:id error:", error);
-      return res
-        .status(500)
-        .json({ ok: false, error: "Falha ao deletar obra (admin)" });
-    }
-
-    return res.json({ ok: true });
-  } catch (err) {
-    console.error("DELETE /obras/admin/:id exception:", err);
     return res.status(500).json({ ok: false, error: "Erro interno" });
   }
 });
