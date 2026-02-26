@@ -954,7 +954,7 @@ app.post("/equipe-obra", requireAuth, async (req, res) => {
 
       const { error: upErr } = await supabaseAdmin
         .from("equipe_obra")
-        .update({ valor_diaria, situacao, observacao })
+        .update({ situacao, observacao })
         .eq("id", id);
 
       if (upErr) {
