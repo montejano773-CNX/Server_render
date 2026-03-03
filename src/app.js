@@ -67,6 +67,14 @@ function normSituacao(v, fallback = "ativo") {
   return s === "inativo" ? "inativo" : "ativo";
 }
 
+function normChavePixTipo(body) {
+  const v = body?.chave_pix_tipo ?? body?.tipo_chave_pix;
+  if (v === undefined || v === null) return null;
+
+  const s = String(v).trim();
+  return s === "" ? null : s;
+}
+
 // --------------------------------------------------
 // Enriquecimento manual (sem depender de FK)
 // ✅ Agora também traz valor_diaria do cadastro_func
@@ -459,7 +467,7 @@ app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
     const { data: funcionarios, error: errFunc } = await supabaseAdmin
       .from("cadastro_func")
       .select(
-        "id, nome, apelido, funcao, razao_social, titular_conta, cpf, banco, agencia, conta, chave_pix, situacao",
+        "id, nome, apelido, funcao, razao_social, titular_conta, cpf, banco, agencia, conta, chave_pix_tipo, chave_pix, situacao",
       )
       .order("nome", { ascending: true });
 
@@ -552,7 +560,9 @@ app.get("/funcionarios", requireAuth, async (req, res) => {
   try {
     const { data, error } = await supabaseAdmin
       .from("cadastro_func")
-      .select("id, nome, apelido, funcao, cpf, situacao, valor_diaria")
+      .select(
+        "id, nome, apelido, funcao, cpf, situacao, valor_diaria, chave_pix_tipo, chave_pix",
+      )
       .order("nome", { ascending: true });
 
     if (error) {
@@ -603,6 +613,10 @@ app.put("/funcionarios/:id", requireAuth, async (req, res) => {
       banco: req.body?.banco ? String(req.body.banco).trim() : null,
       agencia: req.body?.agencia ? String(req.body.agencia).trim() : null,
       conta: req.body?.conta ? String(req.body.conta).trim() : null,
+
+      // ✅ AJUSTE (1/3): usa helper
+      chave_pix_tipo: normChavePixTipo(req.body),
+
       chave_pix: req.body?.chave_pix ? String(req.body.chave_pix).trim() : null,
       observacao: req.body?.observacao
         ? String(req.body.observacao).trim()
@@ -665,6 +679,10 @@ app.post("/funcionarios", requireAuth, async (req, res) => {
       banco: req.body?.banco?.trim?.() || null,
       agencia: req.body?.agencia?.trim?.() || null,
       conta: req.body?.conta?.trim?.() || null,
+
+      // ✅ AJUSTE (2/3): usa helper
+      chave_pix_tipo: normChavePixTipo(req.body),
+
       chave_pix: req.body?.chave_pix?.trim?.() || null,
       observacao: req.body?.observacao?.trim?.() || null,
     };
@@ -736,6 +754,13 @@ app.patch("/funcionarios/:id", requireAuth, async (req, res) => {
       ...(req.body?.conta !== undefined
         ? { conta: req.body.conta ? String(req.body.conta).trim() : null }
         : {}),
+
+      // ✅ AJUSTE (3/3): usa helper quando vier qualquer um dos campos
+      ...(req.body?.chave_pix_tipo !== undefined ||
+      req.body?.tipo_chave_pix !== undefined
+        ? { chave_pix_tipo: normChavePixTipo(req.body) }
+        : {}),
+
       ...(req.body?.chave_pix !== undefined
         ? {
             chave_pix: req.body.chave_pix
