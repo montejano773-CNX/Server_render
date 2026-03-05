@@ -467,7 +467,7 @@ app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
     const { data: funcionarios, error: errFunc } = await supabaseAdmin
       .from("cadastro_func")
       .select(
-        "id, nome, apelido, funcao, razao_social, titular_conta, cpf, banco, agencia, conta, chave_pix_tipo, chave_pix, situacao",
+        "id, nome, funcao, razao_social, titular_conta, cpf, banco, agencia, conta, chave_pix_tipo, chave_pix, situacao",
       )
       .order("nome", { ascending: true });
 
@@ -561,7 +561,7 @@ app.get("/funcionarios", requireAuth, async (req, res) => {
     const { data, error } = await supabaseAdmin
       .from("cadastro_func")
       .select(
-        "id, nome, apelido, funcao, cpf, situacao, valor_diaria, chave_pix_tipo, chave_pix",
+        "id, nome, funcao, cpf, situacao, valor_diaria, chave_pix_tipo, chave_pix",
       )
       .order("nome", { ascending: true });
 
@@ -599,7 +599,6 @@ app.put("/funcionarios/:id", requireAuth, async (req, res) => {
 
     const payload = {
       nome,
-      apelido: req.body?.apelido ? String(req.body.apelido).trim() : null,
       funcao: req.body?.funcao ? String(req.body.funcao).trim() : null,
       valor_diaria: vdi,
       cpf: req.body?.cpf ? String(req.body.cpf).replace(/\D/g, "") : null,
@@ -668,10 +667,20 @@ app.get("/funcionarios/:id", requireAuth, async (req, res) => {
 
 app.post("/funcionarios", requireAuth, async (req, res) => {
   try {
+    const vdi = normValorDiaria(req.body?.valor_diaria);
+    if (Number.isNaN(vdi)) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "valor_diaria inválido" });
+    }
+
     const payload = {
       nome: (req.body?.nome || "").trim(),
-      apelido: req.body?.apelido?.trim?.() || null,
       funcao: req.body?.funcao?.trim?.() || null,
+
+      // ✅ salvar valor_diaria (se vier ""/null -> null, se vier 0 -> 0)
+      valor_diaria: vdi ?? 0,
+
       cpf: req.body?.cpf ? String(req.body.cpf).replace(/\D/g, "") : null,
       situacao: normSituacao(req.body?.situacao, "ativo"),
       razao_social: req.body?.razao_social?.trim?.() || null,
@@ -679,10 +688,7 @@ app.post("/funcionarios", requireAuth, async (req, res) => {
       banco: req.body?.banco?.trim?.() || null,
       agencia: req.body?.agencia?.trim?.() || null,
       conta: req.body?.conta?.trim?.() || null,
-
-      // ✅ AJUSTE (2/3): usa helper
       chave_pix_tipo: normChavePixTipo(req.body),
-
       chave_pix: req.body?.chave_pix?.trim?.() || null,
       observacao: req.body?.observacao?.trim?.() || null,
     };
@@ -718,9 +724,6 @@ app.patch("/funcionarios/:id", requireAuth, async (req, res) => {
     const patch = {
       ...(req.body?.nome !== undefined
         ? { nome: String(req.body.nome).trim() }
-        : {}),
-      ...(req.body?.apelido !== undefined
-        ? { apelido: req.body.apelido ? String(req.body.apelido).trim() : null }
         : {}),
       ...(req.body?.funcao !== undefined
         ? { funcao: req.body.funcao ? String(req.body.funcao).trim() : null }
