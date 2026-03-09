@@ -699,7 +699,7 @@ app.get("/funcionarios", requireAuth, async (req, res) => {
     const { data, error } = await supabaseAdmin
       .from("cadastro_func")
       .select(
-        "id, nome, funcao, cpf, situacao, valor_diaria, chave_pix_tipo, chave_pix",
+        "id, nome, funcao, cpf, rg, situacao, valor_diaria, chave_pix_tipo, chave_pix",
       )
       .order("nome", { ascending: true });
 
@@ -744,6 +744,7 @@ app.put("/funcionarios/:id", requireAuth, async (req, res) => {
       nome,
       funcao: req.body?.funcao ? String(req.body.funcao).trim() : null,
       valor_diaria: vdi,
+      rg: req.body?.rg ? String(req.body.rg).trim() : null,
       cpf: req.body?.cpf ? String(req.body.cpf).replace(/\D/g, "") : null,
       situacao: normSituacao(req.body?.situacao, "ativo"),
       razao_social: req.body?.razao_social
@@ -833,6 +834,7 @@ app.post("/funcionarios", requireAuth, async (req, res) => {
       valor_diaria: vdi ?? 0,
 
       cpf: req.body?.cpf ? String(req.body.cpf).replace(/\D/g, "") : null,
+      rg: req.body?.rg ? String(req.body.rg).trim() : null,
       situacao: normSituacao(req.body?.situacao, "ativo"),
       razao_social: req.body?.razao_social?.trim?.() || null,
       titular_conta: req.body?.titular_conta?.trim?.() || null,
@@ -886,6 +888,9 @@ app.patch("/funcionarios/:id", requireAuth, async (req, res) => {
         : {}),
       ...(req.body?.cpf !== undefined
         ? { cpf: req.body.cpf ? String(req.body.cpf).replace(/\D/g, "") : null }
+        : {}),
+      ...(req.body?.rg !== undefined
+        ? { rg: req.body.rg ? String(req.body.rg).trim() : null }
         : {}),
       ...(req.body?.situacao !== undefined
         ? { situacao: normSituacao(req.body.situacao) }
