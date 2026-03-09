@@ -74,7 +74,82 @@ function normChavePixTipo(body) {
   const s = String(v).trim();
   return s === "" ? null : s;
 }
+// ==================================================
+// PERMISSÕES
+// ==================================================
+async function getUsuarioLogado(authUserId) {
+  const { data, error } = await supabaseAdmin
+    .from("cadastro_user")
+    .select("id, nome, email, nivel_acesso, situacao")
+    .eq("id", authUserId)
+    .single();
 
+  if (error || !data) {
+    throw new Error("USUARIO_NAO_ENCONTRADO");
+  }
+
+  return data;
+}
+
+function getNivel(usuario) {
+  return String(usuario?.nivel_acesso || "")
+    .trim()
+    .toLowerCase();
+}
+
+function isAdmin(usuario) {
+  return getNivel(usuario) === "admin";
+}
+
+function isFinanceiro(usuario) {
+  return getNivel(usuario) === "financeiro";
+}
+
+function isEncarregado(usuario) {
+  return getNivel(usuario) === "encarregado";
+}
+
+function isConsulta(usuario) {
+  return getNivel(usuario) === "consulta";
+}
+
+function deny(res, mensagem = "Sem permissão para esta ação") {
+  return res.status(403).json({ ok: false, error: mensagem });
+}
+
+async function encarregadoPodeAcessarObra(authUserId, obraId) {
+  const { data, error } = await supabaseAdmin
+    .from("cadastro_obra")
+    .select("id")
+    .eq("id", obraId)
+    .eq("responsavel", authUserId)
+    .maybeSingle();
+
+  if (error) return false;
+  return !!data;
+}
+
+async function getEquipeObraById(id) {
+  const { data, error } = await supabaseAdmin
+    .from("equipe_obra")
+    .select("id, obra_id, funcionario_id, situacao")
+    .eq("id", id)
+    .single();
+
+  if (error) return null;
+  return data;
+}
+
+async function getEmpreitaById(id) {
+  const { data, error } = await supabaseAdmin
+    .from("empreitas")
+    .select("id, obra_id, funcionario_id, data_pagamento, valor, descricao")
+    .eq("id", id)
+    .single();
+
+  if (error) return null;
+  return data;
+}
 // --------------------------------------------------
 // Enriquecimento manual (sem depender de FK)
 // ✅ Agora também traz valor_diaria do cadastro_func
@@ -197,12 +272,52 @@ app.get("/me", requireAuth, async (req, res) => {
     return res.status(500).json({ ok: false, error: "Erro interno" });
   }
 });
+// ==================================================
+// USUÁRIOS RESPONSAVEIS (CRUD)
+// ==================================================
+app.get("/usuarios/responsaveis", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
 
+    if (!(isAdmin(usuario) || isFinanceiro(usuario))) {
+      return deny(
+        res,
+        "Apenas administrador ou financeiro pode listar responsáveis",
+      );
+    }
+
+    const { data, error } = await supabaseAdmin
+      .from("cadastro_user")
+      .select("id, auth_user_id, nome, email, nivel_acesso, situacao")
+      .eq("situacao", "ativo")
+      .in("nivel_acesso", ["encarregado", "admin"])
+      .order("nome", { ascending: true });
+
+    if (error) {
+      console.error("GET /usuarios/responsaveis error:", error);
+      return res.status(500).json({
+        ok: false,
+        error: "Falha ao listar responsáveis",
+      });
+    }
+
+    return res.json({ ok: true, data: data || [] });
+  } catch (err) {
+    console.error("GET /usuarios/responsaveis exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
 // ==================================================
 // USUÁRIOS (CRUD) - (mantido igual ao seu)
 // ==================================================
 app.get("/usuarios", requireAuth, async (req, res) => {
   try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+
+    if (!isAdmin(usuario)) {
+      return deny(res, "Apenas administrador pode listar usuários");
+    }
+
     const { data, error } = await supabaseAdmin
       .from("cadastro_user")
       .select("id, nome, email, nivel_acesso, situacao")
@@ -224,6 +339,12 @@ app.get("/usuarios", requireAuth, async (req, res) => {
 
 app.get("/usuarios/:id", requireAuth, async (req, res) => {
   try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+
+    if (!isAdmin(usuario)) {
+      return deny(res, "Apenas administrador pode consultar usuário");
+    }
+
     const id = req.params.id;
 
     const { data, error } = await supabaseAdmin
@@ -248,6 +369,11 @@ app.get("/usuarios/:id", requireAuth, async (req, res) => {
 
 app.post("/usuarios", requireAuth, async (req, res) => {
   try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+
+    if (!isAdmin(usuario)) {
+      return deny(res, "Apenas administrador pode criar usuários");
+    }
     const nome = (req.body?.nome || "").trim();
     const email = (req.body?.email || "").trim();
     const senha = (req.body?.senha || "").trim();
@@ -294,6 +420,7 @@ app.post("/usuarios", requireAuth, async (req, res) => {
 
     const row = {
       id: newAuthId,
+      auth_user_id: newAuthId,
       nome,
       email,
       nivel_acesso,
@@ -328,6 +455,11 @@ app.post("/usuarios", requireAuth, async (req, res) => {
 
 app.patch("/usuarios/:id", requireAuth, async (req, res) => {
   try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+
+    if (!isAdmin(usuario)) {
+      return deny(res, "Apenas administrador pode editar usuários");
+    }
     const id = req.params.id;
 
     const patch = {
@@ -411,6 +543,11 @@ app.patch("/usuarios/:id", requireAuth, async (req, res) => {
 
 app.delete("/usuarios/:id", requireAuth, async (req, res) => {
   try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+
+    if (!isAdmin(usuario)) {
+      return deny(res, "Apenas administrador pode excluir usuários");
+    }
     const id = req.params.id;
 
     const { error: delRowErr } = await supabaseAdmin
@@ -558,6 +695,7 @@ app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
 // ==================================================
 app.get("/funcionarios", requireAuth, async (req, res) => {
   try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
     const { data, error } = await supabaseAdmin
       .from("cadastro_func")
       .select(
@@ -581,6 +719,11 @@ app.get("/funcionarios", requireAuth, async (req, res) => {
 
 app.put("/funcionarios/:id", requireAuth, async (req, res) => {
   try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+
+    if (!isAdmin(usuario)) {
+      return deny(res, "Apenas administrador pode editar funcionário");
+    }
     const id = req.params.id;
 
     const nome = String(req.body?.nome || "").trim();
@@ -667,6 +810,14 @@ app.get("/funcionarios/:id", requireAuth, async (req, res) => {
 
 app.post("/funcionarios", requireAuth, async (req, res) => {
   try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+
+    if (!(isAdmin(usuario) || isFinanceiro(usuario))) {
+      return deny(
+        res,
+        "Apenas administrador ou financeiro pode cadastrar funcionário",
+      );
+    }
     const vdi = normValorDiaria(req.body?.valor_diaria);
     if (Number.isNaN(vdi)) {
       return res
@@ -719,6 +870,11 @@ app.post("/funcionarios", requireAuth, async (req, res) => {
 
 app.patch("/funcionarios/:id", requireAuth, async (req, res) => {
   try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+
+    if (!isAdmin(usuario)) {
+      return deny(res, "Apenas administrador pode editar funcionário");
+    }
     const id = req.params.id;
 
     const patch = {
@@ -805,6 +961,11 @@ app.patch("/funcionarios/:id", requireAuth, async (req, res) => {
 
 app.delete("/funcionarios/:id", requireAuth, async (req, res) => {
   try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+
+    if (!isAdmin(usuario)) {
+      return deny(res, "Apenas administrador pode excluir funcionário");
+    }
     const id = req.params.id;
 
     const { error } = await supabaseAdmin
@@ -834,6 +995,8 @@ app.delete("/funcionarios/:id", requireAuth, async (req, res) => {
 // LISTAR EQUIPE DA OBRA
 app.get("/equipe-obra", requireAuth, async (req, res) => {
   try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    const authId = req.authUser.id;
     const obraId = String(req.query?.obra_id || "").trim();
 
     if (!isUuid(obraId)) {
@@ -841,6 +1004,20 @@ app.get("/equipe-obra", requireAuth, async (req, res) => {
         ok: false,
         error: "obra_id inválido (precisa ser UUID)",
       });
+    }
+
+    if (isConsulta(usuario)) {
+      return deny(res, "Usuário somente consulta não acessa equipe por obra");
+    }
+
+    if (isEncarregado(usuario)) {
+      const pode = await encarregadoPodeAcessarObra(authId, obraId);
+      if (!pode) {
+        return deny(
+          res,
+          "Você só pode acessar a equipe das suas próprias obras",
+        );
+      }
     }
 
     const { data, error } = await supabaseAdmin
@@ -868,6 +1045,21 @@ app.get("/equipe-obra", requireAuth, async (req, res) => {
 // ✅ SEM valor_diaria
 app.post("/equipe-obra", requireAuth, async (req, res) => {
   try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    const authId = req.authUser.id;
+
+    if (isConsulta(usuario)) {
+      return deny(
+        res,
+        "Usuário somente consulta não pode alterar equipe por obra",
+      );
+    }
+
+    if (
+      !(isAdmin(usuario) || isFinanceiro(usuario) || isEncarregado(usuario))
+    ) {
+      return deny(res);
+    }
     const obra_id = String(req.body?.obra_id || "").trim();
     const funcionario_id = String(req.body?.funcionario_id || "").trim();
 
@@ -881,7 +1073,12 @@ app.post("/equipe-obra", requireAuth, async (req, res) => {
         .status(400)
         .json({ ok: false, error: "funcionario_id inválido (UUID)" });
     }
-
+    if (isEncarregado(usuario)) {
+      const pode = await encarregadoPodeAcessarObra(authId, obra_id);
+      if (!pode) {
+        return deny(res, "Você só pode alterar equipe das suas próprias obras");
+      }
+    }
     const situacao = normSituacao(req.body?.situacao, "ativo");
     const observacao = req.body?.observacao
       ? String(req.body.observacao).trim()
@@ -943,10 +1140,39 @@ app.post("/equipe-obra", requireAuth, async (req, res) => {
 // REMOVER (INATIVAR)
 app.delete("/equipe-obra/:id", requireAuth, async (req, res) => {
   try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    const authId = req.authUser.id;
     const id = String(req.params.id || "").trim();
 
     if (!isUuid(id)) {
       return res.status(400).json({ ok: false, error: "id inválido (UUID)" });
+    }
+
+    if (isConsulta(usuario)) {
+      return deny(
+        res,
+        "Usuário somente consulta não pode remover equipe por obra",
+      );
+    }
+
+    if (
+      !(isAdmin(usuario) || isFinanceiro(usuario) || isEncarregado(usuario))
+    ) {
+      return deny(res);
+    }
+
+    const vinculo = await getEquipeObraById(id);
+    if (!vinculo) {
+      return res
+        .status(404)
+        .json({ ok: false, error: "Vínculo não encontrado" });
+    }
+
+    if (isEncarregado(usuario)) {
+      const pode = await encarregadoPodeAcessarObra(authId, vinculo.obra_id);
+      if (!pode) {
+        return deny(res, "Você só pode remover equipe das suas próprias obras");
+      }
     }
 
     const { error } = await supabaseAdmin
@@ -967,13 +1193,15 @@ app.delete("/equipe-obra/:id", requireAuth, async (req, res) => {
     return res.status(500).json({ ok: false, error: "Erro interno" });
   }
 });
-
 // =====================================================
 // DIÁRIAS - SELECT + UPSERT (lanc_diarias)
 // (mantido igual ao seu)
 // =====================================================
 app.get("/lanc-diarias", requireAuth, async (req, res) => {
   try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    const authId = req.authUser.id;
+
     const obra_id = String(req.query?.obra_id || "").trim();
     const data_inicio = String(req.query?.data_inicio || "").trim();
     const data_fim = String(req.query?.data_fim || "").trim();
@@ -983,6 +1211,23 @@ app.get("/lanc-diarias", requireAuth, async (req, res) => {
         ok: false,
         error: "Parâmetros obrigatórios: obra_id(UUID), data_inicio, data_fim",
       });
+    }
+
+    if (!(isAdmin(usuario) || isEncarregado(usuario))) {
+      return deny(
+        res,
+        "Apenas administrador ou encarregado pode acessar diárias",
+      );
+    }
+
+    if (isEncarregado(usuario)) {
+      const pode = await encarregadoPodeAcessarObra(authId, obra_id);
+      if (!pode) {
+        return deny(
+          res,
+          "Você só pode acessar diárias das suas próprias obras",
+        );
+      }
     }
 
     const { data, error } = await supabaseAdmin
@@ -1008,6 +1253,15 @@ app.get("/lanc-diarias", requireAuth, async (req, res) => {
 
 app.post("/lanc-diarias", requireAuth, async (req, res) => {
   try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    const authId = req.authUser.id;
+
+    if (!(isAdmin(usuario) || isEncarregado(usuario))) {
+      return deny(
+        res,
+        "Apenas administrador ou encarregado pode lançar diárias",
+      );
+    }
     const registros = req.body?.registros;
     if (!Array.isArray(registros) || registros.length === 0) {
       return res
@@ -1035,7 +1289,19 @@ app.post("/lanc-diarias", requireAuth, async (req, res) => {
 
       return { obra_id, funcionario_id, data, qtd, valor_diaria_aplicado: vda };
     });
+    if (isEncarregado(usuario)) {
+      const obraIds = [...new Set(normalized.map((r) => r.obra_id))];
 
+      for (const obraId of obraIds) {
+        const pode = await encarregadoPodeAcessarObra(authId, obraId);
+        if (!pode) {
+          return deny(
+            res,
+            "Você só pode lançar diárias nas suas próprias obras",
+          );
+        }
+      }
+    }
     const { error } = await supabaseAdmin
       .from("lanc_diarias")
       .upsert(normalized, { onConflict: "obra_id,funcionario_id,data" });
@@ -1061,6 +1327,8 @@ app.post("/lanc-diarias", requireAuth, async (req, res) => {
 // =====================================================
 app.get("/diarias-ajustes", requireAuth, async (req, res) => {
   try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    const authId = req.authUser.id;
     const obra_id = String(req.query?.obra_id || "").trim();
     const data_inicio = String(req.query?.data_inicio || "").trim();
 
@@ -1074,11 +1342,26 @@ app.get("/diarias-ajustes", requireAuth, async (req, res) => {
     const { data, error } = await supabaseAdmin
       .from("lanc_diarias_ajustes")
       .select(
-        "obra_id, funcionario_id, data_inicio, reembolso, adiantamento, valor",
+        "obra_id, funcionario_id, data_inicio, reembolso, adiantamento, observacao, valor",
       )
       .eq("obra_id", obra_id)
       .eq("data_inicio", data_inicio);
+    if (!(isAdmin(usuario) || isEncarregado(usuario))) {
+      return deny(
+        res,
+        "Apenas administrador ou encarregado pode acessar ajustes de diárias",
+      );
+    }
 
+    if (isEncarregado(usuario)) {
+      const pode = await encarregadoPodeAcessarObra(authId, obra_id);
+      if (!pode) {
+        return deny(
+          res,
+          "Você só pode acessar ajustes das suas próprias obras",
+        );
+      }
+    }
     if (error) {
       console.error("GET /diarias-ajustes error:", error);
       return res
@@ -1095,6 +1378,15 @@ app.get("/diarias-ajustes", requireAuth, async (req, res) => {
 
 app.post("/diarias-ajustes", requireAuth, async (req, res) => {
   try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    const authId = req.authUser.id;
+
+    if (!(isAdmin(usuario) || isEncarregado(usuario))) {
+      return deny(
+        res,
+        "Apenas administrador ou encarregado pode salvar ajustes de diárias",
+      );
+    }
     const ajustes = req.body?.ajustes;
     if (!Array.isArray(ajustes)) {
       return res
@@ -1119,6 +1411,7 @@ app.post("/diarias-ajustes", requireAuth, async (req, res) => {
       if (!Number.isFinite(reembolso_centavos) || reembolso_centavos < 0) {
         throw new Error("reembolso_centavos inválido.");
       }
+
       if (
         !Number.isFinite(adiantamento_centavos) ||
         adiantamento_centavos < 0
@@ -1134,16 +1427,34 @@ app.post("/diarias-ajustes", requireAuth, async (req, res) => {
         throw new Error("valor (diária) inválido.");
       }
 
+      const observacao =
+        a.observacao !== undefined && a.observacao !== null
+          ? String(a.observacao).trim()
+          : null;
+
       return {
         obra_id,
         funcionario_id,
         data_inicio,
         reembolso,
         adiantamento,
+        observacao,
         valor,
       };
     });
+    if (isEncarregado(usuario)) {
+      const obraIds = [...new Set(normalized.map((a) => a.obra_id))];
 
+      for (const obraId of obraIds) {
+        const pode = await encarregadoPodeAcessarObra(authId, obraId);
+        if (!pode) {
+          return deny(
+            res,
+            "Você só pode salvar ajustes nas suas próprias obras",
+          );
+        }
+      }
+    }
     const { error } = await supabaseAdmin
       .from("lanc_diarias_ajustes")
       .upsert(normalized, { onConflict: "obra_id,funcionario_id,data_inicio" });
@@ -1170,9 +1481,43 @@ app.post("/diarias-ajustes", requireAuth, async (req, res) => {
 // =====================================================
 app.get("/funcionarios-vinculados", requireAuth, async (req, res) => {
   try {
-    const { data, error } = await supabaseAdmin
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    const authId = req.authUser.id;
+
+    if (isConsulta(usuario)) {
+      return deny(res, "Usuário somente consulta não acessa vínculos por obra");
+    }
+
+    let query = supabaseAdmin
       .from("equipe_obra")
       .select("obra_id, funcionario_id, situacao");
+
+    if (isEncarregado(usuario)) {
+      const { data: obrasDoEncarregado, error: obrasErr } = await supabaseAdmin
+        .from("cadastro_obra")
+        .select("id")
+        .eq("responsavel", authId);
+
+      if (obrasErr) {
+        console.error(
+          "GET /funcionarios-vinculados obras encarregado error:",
+          obrasErr,
+        );
+        return res
+          .status(500)
+          .json({ ok: false, error: "Erro ao buscar obras do encarregado" });
+      }
+
+      const obraIds = (obrasDoEncarregado || []).map((o) => o.id);
+
+      if (!obraIds.length) {
+        return res.json({ ok: true, data: [] });
+      }
+
+      query = query.in("obra_id", obraIds);
+    }
+
+    const { data, error } = await query;
 
     if (error) {
       console.error("GET /funcionarios-vinculados error:", error);
@@ -1188,7 +1533,6 @@ app.get("/funcionarios-vinculados", requireAuth, async (req, res) => {
       id: r.funcionario_id,
       nome: r.funcionario_nome,
       funcao: r.funcionario_funcao,
-      // ✅ diária vem do cadastro_func via enrich
       valor_diaria: Number(r.funcionario_valor_diaria || r.valor_diaria || 0),
       obra_id: r.obra_id,
       obra_nome: r.obra_nome,
@@ -1208,6 +1552,14 @@ app.get("/funcionarios-vinculados", requireAuth, async (req, res) => {
 // =====================================================
 app.get("/equipe-obra/todas", requireAuth, async (req, res) => {
   try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+
+    if (!(isAdmin(usuario) || isFinanceiro(usuario))) {
+      return deny(
+        res,
+        "Apenas administrador ou financeiro pode ver todas as equipes",
+      );
+    }
     const { data, error } = await supabaseAdmin
       .from("equipe_obra")
       .select("obra_id, funcionario_id, situacao");
@@ -1249,7 +1601,16 @@ app.get("/equipe-obra/todas", requireAuth, async (req, res) => {
 // ==================================================
 app.get("/empreitas", requireAuth, async (req, res) => {
   try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    const authId = req.authUser.id;
     const { inicio, fim, obra_id, funcionario_id } = req.query;
+
+    if (!(isAdmin(usuario) || isEncarregado(usuario))) {
+      return deny(
+        res,
+        "Apenas administrador ou encarregado pode acessar empreitas",
+      );
+    }
 
     let q = supabaseAdmin
       .from("empreitas")
@@ -1265,6 +1626,17 @@ app.get("/empreitas", requireAuth, async (req, res) => {
           .status(400)
           .json({ ok: false, error: "obra_id inválido (UUID)" });
       }
+
+      if (isEncarregado(usuario)) {
+        const pode = await encarregadoPodeAcessarObra(authId, obra_id);
+        if (!pode) {
+          return deny(
+            res,
+            "Você só pode acessar empreitas das suas próprias obras",
+          );
+        }
+      }
+
       q = q.eq("obra_id", obra_id);
     }
 
@@ -1275,6 +1647,28 @@ app.get("/empreitas", requireAuth, async (req, res) => {
           .json({ ok: false, error: "funcionario_id inválido (UUID)" });
       }
       q = q.eq("funcionario_id", funcionario_id);
+    }
+
+    if (isEncarregado(usuario) && !obra_id) {
+      const { data: obrasDoEncarregado, error: obrasErr } = await supabaseAdmin
+        .from("cadastro_obra")
+        .select("id")
+        .eq("responsavel", authId);
+
+      if (obrasErr) {
+        console.error("GET /empreitas obras encarregado error:", obrasErr);
+        return res
+          .status(500)
+          .json({ ok: false, error: "Erro ao buscar obras do encarregado" });
+      }
+
+      const obraIds = (obrasDoEncarregado || []).map((o) => o.id);
+
+      if (!obraIds.length) {
+        return res.json({ ok: true, data: [] });
+      }
+
+      q = q.in("obra_id", obraIds);
     }
 
     if (inicio) q = q.gte("data_pagamento", String(inicio));
@@ -1299,7 +1693,16 @@ app.get("/empreitas", requireAuth, async (req, res) => {
 // (resto empreitas CRUD igual ao seu...)
 app.get("/empreitas/:id", requireAuth, async (req, res) => {
   try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    const authId = req.authUser.id;
     const id = req.params.id;
+
+    if (!(isAdmin(usuario) || isEncarregado(usuario))) {
+      return deny(
+        res,
+        "Apenas administrador ou encarregado pode consultar empreita",
+      );
+    }
 
     const { data, error } = await supabaseAdmin
       .from("empreitas")
@@ -1314,6 +1717,16 @@ app.get("/empreitas/:id", requireAuth, async (req, res) => {
         .json({ ok: false, error: "Empreita não encontrada" });
     }
 
+    if (isEncarregado(usuario)) {
+      const pode = await encarregadoPodeAcessarObra(authId, data.obra_id);
+      if (!pode) {
+        return deny(
+          res,
+          "Você só pode acessar empreitas das suas próprias obras",
+        );
+      }
+    }
+
     return res.json({ ok: true, data });
   } catch (err) {
     console.error("GET /empreitas/:id exception:", err);
@@ -1323,6 +1736,15 @@ app.get("/empreitas/:id", requireAuth, async (req, res) => {
 
 app.post("/empreitas", requireAuth, async (req, res) => {
   try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    const authId = req.authUser.id;
+
+    if (!(isAdmin(usuario) || isEncarregado(usuario))) {
+      return deny(
+        res,
+        "Apenas administrador ou encarregado pode lançar empreita",
+      );
+    }
     const obra_id = req.body?.obra_id;
     const funcionario_id = req.body?.funcionario_id;
     const data_pagamento = req.body?.data_pagamento;
@@ -1335,6 +1757,15 @@ app.post("/empreitas", requireAuth, async (req, res) => {
       return res
         .status(400)
         .json({ ok: false, error: "obra_id é obrigatório (UUID)" });
+    }
+    if (isEncarregado(usuario)) {
+      const pode = await encarregadoPodeAcessarObra(authId, obra_id);
+      if (!pode) {
+        return deny(
+          res,
+          "Você só pode lançar empreita nas suas próprias obras",
+        );
+      }
     }
     if (!isUuid(funcionario_id)) {
       return res
@@ -1387,13 +1818,23 @@ app.post("/empreitas", requireAuth, async (req, res) => {
 // ==================================================
 app.get("/obras", requireAuth, async (req, res) => {
   try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
     const authId = req.authUser.id;
 
-    const { data, error } = await supabaseAdmin
+    if (isConsulta(usuario)) {
+      return deny(res, "Usuário somente consulta não acessa obras");
+    }
+
+    let query = supabaseAdmin
       .from("cadastro_obra")
       .select("id, nome, cidade, uf, situacao, responsavel")
-      .eq("responsavel", authId)
       .order("nome", { ascending: true });
+
+    if (isEncarregado(usuario)) {
+      query = query.eq("responsavel", authId);
+    }
+
+    const { data, error } = await query;
 
     if (error) {
       console.error("GET /obras error:", error);
@@ -1411,6 +1852,14 @@ app.get("/obras", requireAuth, async (req, res) => {
 
 app.get("/obras/todas", requireAuth, async (req, res) => {
   try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+
+    if (!(isAdmin(usuario) || isFinanceiro(usuario))) {
+      return deny(
+        res,
+        "Apenas administrador ou financeiro pode ver todas as obras",
+      );
+    }
     const { data, error } = await supabaseAdmin
       .from("cadastro_obra")
       .select("id, nome, cidade, uf, situacao, responsavel")
@@ -1429,7 +1878,313 @@ app.get("/obras/todas", requireAuth, async (req, res) => {
     return res.status(500).json({ ok: false, error: "Erro interno" });
   }
 });
+app.post("/obras", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
 
+    if (!(isAdmin(usuario) || isFinanceiro(usuario))) {
+      return deny(
+        res,
+        "Apenas administrador ou financeiro pode cadastrar obra",
+      );
+    }
+
+    const nome = String(req.body?.nome || "").trim();
+    const endereco = req.body?.endereco
+      ? String(req.body.endereco).trim()
+      : null;
+    const cidade = req.body?.cidade ? String(req.body.cidade).trim() : null;
+    const uf = req.body?.uf ? String(req.body.uf).trim().toUpperCase() : null;
+    const responsavel = String(req.body?.responsavel || "").trim();
+    const situacao = normSituacao(req.body?.situacao, "ativo");
+    const observacao = req.body?.observacao
+      ? String(req.body.observacao).trim()
+      : null;
+
+    if (!nome) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "Informe o nome da obra" });
+    }
+
+    if (!isUuid(responsavel)) {
+      return res.status(400).json({
+        ok: false,
+        error: "responsavel é obrigatório e precisa ser UUID",
+      });
+    }
+
+    const { data: respUser, error: respErr } = await supabaseAdmin
+      .from("cadastro_user")
+      .select("id, nome, situacao, nivel_acesso")
+      .eq("id", responsavel)
+      .single();
+
+    if (respErr || !respUser) {
+      return res.status(400).json({
+        ok: false,
+        error: "Responsável não encontrado",
+      });
+    }
+
+    if (String(respUser.situacao || "").toLowerCase() !== "ativo") {
+      return res.status(400).json({
+        ok: false,
+        error: "O responsável selecionado está inativo",
+      });
+    }
+
+    const payload = {
+      nome,
+      endereco,
+      cidade,
+      uf,
+      responsavel,
+      situacao,
+      observacao,
+    };
+
+    const { data, error } = await supabaseAdmin
+      .from("cadastro_obra")
+      .insert(payload)
+      .select("id")
+      .single();
+
+    if (error) {
+      console.error("POST /obras error:", error);
+      return res.status(500).json({
+        ok: false,
+        error: "Falha ao salvar obra",
+      });
+    }
+
+    return res.status(201).json({ ok: true, data });
+  } catch (err) {
+    console.error("POST /obras exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
+app.put("/obras/:id", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+
+    if (!isAdmin(usuario)) {
+      return deny(res, "Apenas administrador pode editar obra");
+    }
+
+    const id = String(req.params.id || "").trim();
+
+    if (!isUuid(id)) {
+      return res.status(400).json({ ok: false, error: "id inválido (UUID)" });
+    }
+
+    const nome = String(req.body?.nome || "").trim();
+    const endereco = req.body?.endereco
+      ? String(req.body.endereco).trim()
+      : null;
+    const cidade = req.body?.cidade ? String(req.body.cidade).trim() : null;
+    const uf = req.body?.uf ? String(req.body.uf).trim().toUpperCase() : null;
+    const responsavel = String(req.body?.responsavel || "").trim();
+    const situacao = normSituacao(req.body?.situacao, "ativo");
+    const observacao = req.body?.observacao
+      ? String(req.body.observacao).trim()
+      : null;
+
+    if (!nome) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "Informe o nome da obra" });
+    }
+
+    if (!isUuid(responsavel)) {
+      return res.status(400).json({
+        ok: false,
+        error: "responsavel é obrigatório e precisa ser UUID",
+      });
+    }
+
+    const { data: respUser, error: respErr } = await supabaseAdmin
+      .from("cadastro_user")
+      .select("id, nome, situacao")
+      .eq("id", responsavel)
+      .single();
+
+    if (respErr || !respUser) {
+      return res.status(400).json({
+        ok: false,
+        error: "Responsável não encontrado",
+      });
+    }
+
+    if (String(respUser.situacao || "").toLowerCase() !== "ativo") {
+      return res.status(400).json({
+        ok: false,
+        error: "O responsável selecionado está inativo",
+      });
+    }
+
+    const payload = {
+      nome,
+      endereco,
+      cidade,
+      uf,
+      responsavel,
+      situacao,
+      observacao,
+    };
+
+    const { error } = await supabaseAdmin
+      .from("cadastro_obra")
+      .update(payload)
+      .eq("id", id);
+
+    if (error) {
+      console.error("PUT /obras/:id error:", error);
+      return res.status(500).json({
+        ok: false,
+        error: "Falha ao atualizar obra",
+      });
+    }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("PUT /obras/:id exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+app.patch("/obras/:id", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+
+    if (!isAdmin(usuario)) {
+      return deny(res, "Apenas administrador pode editar obra");
+    }
+
+    const id = String(req.params.id || "").trim();
+
+    if (!isUuid(id)) {
+      return res.status(400).json({ ok: false, error: "id inválido (UUID)" });
+    }
+
+    const patch = {
+      ...(req.body?.nome !== undefined
+        ? { nome: String(req.body.nome || "").trim() }
+        : {}),
+      ...(req.body?.endereco !== undefined
+        ? {
+            endereco: req.body.endereco
+              ? String(req.body.endereco).trim()
+              : null,
+          }
+        : {}),
+      ...(req.body?.cidade !== undefined
+        ? { cidade: req.body.cidade ? String(req.body.cidade).trim() : null }
+        : {}),
+      ...(req.body?.uf !== undefined
+        ? { uf: req.body.uf ? String(req.body.uf).trim().toUpperCase() : null }
+        : {}),
+      ...(req.body?.situacao !== undefined
+        ? { situacao: normSituacao(req.body.situacao) }
+        : {}),
+      ...(req.body?.observacao !== undefined
+        ? {
+            observacao: req.body.observacao
+              ? String(req.body.observacao).trim()
+              : null,
+          }
+        : {}),
+    };
+
+    if (req.body?.responsavel !== undefined) {
+      const responsavel = String(req.body.responsavel || "").trim();
+
+      if (!isUuid(responsavel)) {
+        return res.status(400).json({
+          ok: false,
+          error: "responsavel inválido (UUID)",
+        });
+      }
+
+      const { data: respUser, error: respErr } = await supabaseAdmin
+        .from("cadastro_user")
+        .select("id, situacao")
+        .eq("id", responsavel)
+        .single();
+
+      if (respErr || !respUser) {
+        return res.status(400).json({
+          ok: false,
+          error: "Responsável não encontrado",
+        });
+      }
+
+      if (String(respUser.situacao || "").toLowerCase() !== "ativo") {
+        return res.status(400).json({
+          ok: false,
+          error: "O responsável selecionado está inativo",
+        });
+      }
+
+      patch.responsavel = responsavel;
+    }
+
+    if (Object.keys(patch).length === 0) {
+      return res.status(400).json({ ok: false, error: "Nada para atualizar" });
+    }
+
+    const { error } = await supabaseAdmin
+      .from("cadastro_obra")
+      .update(patch)
+      .eq("id", id);
+
+    if (error) {
+      console.error("PATCH /obras/:id error:", error);
+      return res.status(500).json({
+        ok: false,
+        error: "Falha ao atualizar obra",
+      });
+    }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("PATCH /obras/:id exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+app.delete("/obras/:id", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+
+    if (!isAdmin(usuario)) {
+      return deny(res, "Apenas administrador pode excluir obra");
+    }
+
+    const id = String(req.params.id || "").trim();
+
+    if (!isUuid(id)) {
+      return res.status(400).json({ ok: false, error: "id inválido (UUID)" });
+    }
+
+    const { error } = await supabaseAdmin
+      .from("cadastro_obra")
+      .delete()
+      .eq("id", id);
+
+    if (error) {
+      console.error("DELETE /obras/:id error:", error);
+      return res.status(500).json({
+        ok: false,
+        error: "Falha ao excluir obra",
+      });
+    }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("DELETE /obras/:id exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
 // ==================================================
 // START
 // ==================================================
