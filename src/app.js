@@ -1812,7 +1812,110 @@ app.post("/empreitas", requireAuth, async (req, res) => {
     return res.status(500).json({ ok: false, error: "Erro interno" });
   }
 });
+app.put("/empreitas/:id", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    const authId = req.authUser.id;
+    const id = String(req.params.id || "").trim();
 
+    if (!isUuid(id)) {
+      return res.status(400).json({ ok: false, error: "id inválido (UUID)" });
+    }
+
+    if (!(isAdmin(usuario) || isEncarregado(usuario))) {
+      return deny(
+        res,
+        "Apenas administrador ou encarregado pode editar empreita",
+      );
+    }
+
+    const empreita = await getEmpreitaById(id);
+    if (!empreita) {
+      return res
+        .status(404)
+        .json({ ok: false, error: "Empreita não encontrada" });
+    }
+
+    if (isEncarregado(usuario)) {
+      const pode = await encarregadoPodeAcessarObra(authId, empreita.obra_id);
+      if (!pode) {
+        return deny(
+          res,
+          "Você só pode editar empreitas das suas próprias obras",
+        );
+      }
+    }
+
+    const obra_id = String(req.body?.obra_id || "").trim();
+    const funcionario_id = String(req.body?.funcionario_id || "").trim();
+    const data_pagamento = String(req.body?.data_pagamento || "").trim();
+    const valor = Number(req.body?.valor || 0);
+    const descricao = req.body?.descricao
+      ? String(req.body.descricao).trim()
+      : null;
+
+    if (!isUuid(obra_id)) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "obra_id inválido (UUID)" });
+    }
+
+    if (!isUuid(funcionario_id)) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "funcionario_id inválido (UUID)" });
+    }
+
+    if (!data_pagamento) {
+      return res.status(400).json({
+        ok: false,
+        error: "data_pagamento é obrigatória",
+      });
+    }
+
+    if (!Number.isFinite(valor) || valor <= 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "valor inválido",
+      });
+    }
+
+    if (isEncarregado(usuario)) {
+      const podeNovaObra = await encarregadoPodeAcessarObra(authId, obra_id);
+      if (!podeNovaObra) {
+        return deny(
+          res,
+          "Você só pode editar empreitas nas suas próprias obras",
+        );
+      }
+    }
+
+    const payload = {
+      obra_id,
+      funcionario_id,
+      data_pagamento,
+      valor,
+      descricao,
+    };
+
+    const { error } = await supabaseAdmin
+      .from("empreitas")
+      .update(payload)
+      .eq("id", id);
+
+    if (error) {
+      console.error("PUT /empreitas/:id error:", error);
+      return res
+        .status(500)
+        .json({ ok: false, error: "Falha ao atualizar empreita" });
+    }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("PUT /empreitas/:id exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
 // ==================================================
 // OBRAS (CRUD) - (mantido igual ao seu)
 // ==================================================
@@ -2182,6 +2285,252 @@ app.delete("/obras/:id", requireAuth, async (req, res) => {
     return res.json({ ok: true });
   } catch (err) {
     console.error("DELETE /obras/:id exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
+// ==================================================
+// QUINZENAS (CRUD) - public.cadastro_quinzena
+// admin: cadastrar, editar, excluir
+// financeiro: cadastrar, editar
+// ==================================================
+
+// LISTAR QUINZENAS
+app.get("/quinzenas", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+
+    if (!(isAdmin(usuario) || isFinanceiro(usuario))) {
+      return deny(
+        res,
+        "Apenas administrador ou financeiro pode listar quinzenas",
+      );
+    }
+
+    const { data, error } = await supabaseAdmin
+      .from("cadastro_quinzena")
+      .select("id, nome, data_inicio, data_fim, created_at, updated_at")
+      .order("data_inicio", { ascending: true });
+
+    if (error) {
+      console.error("GET /quinzenas error:", error);
+      return res
+        .status(500)
+        .json({ ok: false, error: "Falha ao listar quinzenas" });
+    }
+
+    return res.json({ ok: true, data: data || [] });
+  } catch (err) {
+    console.error("GET /quinzenas exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
+// CRIAR QUINZENA
+app.post("/quinzenas", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+
+    if (!(isAdmin(usuario) || isFinanceiro(usuario))) {
+      return deny(
+        res,
+        "Apenas administrador ou financeiro pode cadastrar quinzena",
+      );
+    }
+
+    const nome = String(req.body?.nome || "").trim();
+    const data_inicio = String(req.body?.data_inicio || "").trim();
+    const data_fim = String(req.body?.data_fim || "").trim();
+
+    if (!nome) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "Informe o nome da quinzena" });
+    }
+
+    if (!data_inicio || !data_fim) {
+      return res.status(400).json({
+        ok: false,
+        error: "Informe data_inicio e data_fim",
+      });
+    }
+
+    if (data_inicio > data_fim) {
+      return res.status(400).json({
+        ok: false,
+        error: "A data início não pode ser maior que a data fim",
+      });
+    }
+
+    // evita duplicidade exata do período
+    const { data: existente, error: errExist } = await supabaseAdmin
+      .from("cadastro_quinzena")
+      .select("id")
+      .eq("data_inicio", data_inicio)
+      .eq("data_fim", data_fim)
+      .limit(1);
+
+    if (errExist) {
+      console.error("POST /quinzenas check existente error:", errExist);
+      return res.status(500).json({
+        ok: false,
+        error: "Falha ao validar quinzena existente",
+      });
+    }
+
+    if (existente && existente.length > 0) {
+      return res.status(409).json({
+        ok: false,
+        error: "Já existe uma quinzena com esse mesmo período",
+      });
+    }
+
+    const payload = {
+      nome,
+      data_inicio,
+      data_fim,
+    };
+
+    const { data, error } = await supabaseAdmin
+      .from("cadastro_quinzena")
+      .insert(payload)
+      .select("id, nome, data_inicio, data_fim, created_at, updated_at")
+      .single();
+
+    if (error) {
+      console.error("POST /quinzenas error:", error);
+      return res
+        .status(500)
+        .json({ ok: false, error: "Falha ao cadastrar quinzena" });
+    }
+
+    return res.status(201).json({ ok: true, data });
+  } catch (err) {
+    console.error("POST /quinzenas exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
+// EDITAR QUINZENA
+app.put("/quinzenas/:id", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+
+    if (!(isAdmin(usuario) || isFinanceiro(usuario))) {
+      return deny(
+        res,
+        "Apenas administrador ou financeiro pode editar quinzena",
+      );
+    }
+
+    const id = String(req.params.id || "").trim();
+    const nome = String(req.body?.nome || "").trim();
+    const data_inicio = String(req.body?.data_inicio || "").trim();
+    const data_fim = String(req.body?.data_fim || "").trim();
+
+    if (!isUuid(id)) {
+      return res.status(400).json({ ok: false, error: "id inválido (UUID)" });
+    }
+
+    if (!nome) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "Informe o nome da quinzena" });
+    }
+
+    if (!data_inicio || !data_fim) {
+      return res.status(400).json({
+        ok: false,
+        error: "Informe data_inicio e data_fim",
+      });
+    }
+
+    if (data_inicio > data_fim) {
+      return res.status(400).json({
+        ok: false,
+        error: "A data início não pode ser maior que a data fim",
+      });
+    }
+
+    // evita duplicidade exata do período em outro registro
+    const { data: existente, error: errExist } = await supabaseAdmin
+      .from("cadastro_quinzena")
+      .select("id")
+      .eq("data_inicio", data_inicio)
+      .eq("data_fim", data_fim)
+      .neq("id", id)
+      .limit(1);
+
+    if (errExist) {
+      console.error("PUT /quinzenas/:id check existente error:", errExist);
+      return res.status(500).json({
+        ok: false,
+        error: "Falha ao validar quinzena existente",
+      });
+    }
+
+    if (existente && existente.length > 0) {
+      return res.status(409).json({
+        ok: false,
+        error: "Já existe outra quinzena com esse mesmo período",
+      });
+    }
+
+    const payload = {
+      nome,
+      data_inicio,
+      data_fim,
+    };
+
+    const { error } = await supabaseAdmin
+      .from("cadastro_quinzena")
+      .update(payload)
+      .eq("id", id);
+
+    if (error) {
+      console.error("PUT /quinzenas/:id error:", error);
+      return res
+        .status(500)
+        .json({ ok: false, error: "Falha ao atualizar quinzena" });
+    }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("PUT /quinzenas/:id exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
+// EXCLUIR QUINZENA
+app.delete("/quinzenas/:id", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+
+    if (!isAdmin(usuario)) {
+      return deny(res, "Apenas administrador pode excluir quinzena");
+    }
+
+    const id = String(req.params.id || "").trim();
+
+    if (!isUuid(id)) {
+      return res.status(400).json({ ok: false, error: "id inválido (UUID)" });
+    }
+
+    const { error } = await supabaseAdmin
+      .from("cadastro_quinzena")
+      .delete()
+      .eq("id", id);
+
+    if (error) {
+      console.error("DELETE /quinzenas/:id error:", error);
+      return res
+        .status(500)
+        .json({ ok: false, error: "Falha ao excluir quinzena" });
+    }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("DELETE /quinzenas/:id exception:", err);
     return res.status(500).json({ ok: false, error: "Erro interno" });
   }
 });
