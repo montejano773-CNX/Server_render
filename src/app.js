@@ -1921,6 +1921,58 @@ app.put("/empreitas/:id", requireAuth, async (req, res) => {
     return res.status(500).json({ ok: false, error: "Erro interno" });
   }
 });
+app.delete("/empreitas/:id", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    const authId = req.authUser.id;
+    const id = String(req.params.id || "").trim();
+
+    if (!isUuid(id)) {
+      return res.status(400).json({ ok: false, error: "id inválido (UUID)" });
+    }
+
+    if (!(isAdmin(usuario) || isEncarregado(usuario))) {
+      return deny(
+        res,
+        "Apenas administrador ou encarregado pode excluir empreita",
+      );
+    }
+
+    const empreita = await getEmpreitaById(id);
+    if (!empreita) {
+      return res
+        .status(404)
+        .json({ ok: false, error: "Empreita não encontrada" });
+    }
+
+    if (isEncarregado(usuario)) {
+      const pode = await encarregadoPodeAcessarObra(authId, empreita.obra_id);
+      if (!pode) {
+        return deny(
+          res,
+          "Você só pode excluir empreitas das suas próprias obras",
+        );
+      }
+    }
+
+    const { error } = await supabaseAdmin
+      .from("empreitas")
+      .delete()
+      .eq("id", id);
+
+    if (error) {
+      console.error("DELETE /empreitas/:id error:", error);
+      return res
+        .status(500)
+        .json({ ok: false, error: "Falha ao excluir empreita" });
+    }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("DELETE /empreitas/:id exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
 // ==================================================
 // OBRAS (CRUD) - (mantido igual ao seu)
 // ==================================================
