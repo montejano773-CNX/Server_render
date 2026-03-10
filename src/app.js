@@ -590,6 +590,16 @@ app.delete("/usuarios/:id", requireAuth, async (req, res) => {
 // ==================================================
 app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
   try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+
+    if (
+      !(isAdmin(usuario) || isFinanceiro(usuario) || isEncarregado(usuario))
+    ) {
+      return deny(
+        res,
+        "Apenas administrador, financeiro ou encarregado pode acessar relatório de pagamento",
+      );
+    }
     const inicio = String(req.query?.inicio || "").trim();
     const fim = String(req.query?.fim || "").trim();
 
@@ -2357,10 +2367,12 @@ app.get("/quinzenas", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
 
-    if (!(isAdmin(usuario) || isFinanceiro(usuario))) {
+    if (
+      !(isAdmin(usuario) || isFinanceiro(usuario) || isEncarregado(usuario))
+    ) {
       return deny(
         res,
-        "Apenas administrador ou financeiro pode listar quinzenas",
+        "Apenas administrador, financeiro ou encarregado pode listar quinzenas",
       );
     }
 
