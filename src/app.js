@@ -2592,6 +2592,184 @@ app.delete("/quinzenas/:id", requireAuth, async (req, res) => {
   }
 });
 // ==================================================
+// RELATÓRIO POR OBRAS (DADOS CRUS)
+// - Agrupamento é feito no front
+// - admin/financeiro: todas as obras
+// - encarregado: somente suas obras
+// ==================================================
+app.get("/relatorios/obras", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    const authId = req.authUser.id;
+
+    const inicio = String(req.query?.inicio || "").trim();
+    const fim = String(req.query?.fim || "").trim();
+
+    if (!inicio || !fim) {
+      return res.status(400).json({
+        ok: false,
+        error: "Informe inicio e fim no formato YYYY-MM-DD",
+      });
+    }
+
+    if (
+      !(isAdmin(usuario) || isFinanceiro(usuario) || isEncarregado(usuario))
+    ) {
+      return deny(
+        res,
+        "Apenas administrador, financeiro ou encarregado pode acessar relatório por obras",
+      );
+    }
+
+    // --------------------------------------------------
+    // 1) Obras permitidas conforme o nível
+    // --------------------------------------------------
+    let qObras = supabaseAdmin
+      .from("cadastro_obra")
+      .select("id, nome, cidade, uf, situacao, responsavel")
+      .order("nome", { ascending: true });
+
+    if (isEncarregado(usuario)) {
+      qObras = qObras.eq("responsavel", authId);
+    }
+
+    const { data: obras, error: errObras } = await qObras;
+
+    if (errObras) {
+      console.error("GET /relatorios/obras obras error:", errObras);
+      return res.status(500).json({
+        ok: false,
+        error: "Falha ao listar obras do relatório",
+      });
+    }
+
+    const obrasList = (obras || []).filter(
+      (o) => String(o.situacao || "ativo").toLowerCase() === "ativo",
+    );
+
+    const obraIds = obrasList.map((o) => o.id);
+
+    if (!obraIds.length) {
+      return res.json({
+        ok: true,
+        obras: [],
+        funcionarios: [],
+        diarias: [],
+        ajustes: [],
+        empreitas: [],
+      });
+    }
+
+    // --------------------------------------------------
+    // 2) Diárias das obras no período
+    // --------------------------------------------------
+    const { data: diarias, error: errDiarias } = await supabaseAdmin
+      .from("lanc_diarias")
+      .select("obra_id, funcionario_id, data, qtd, valor_diaria_aplicado")
+      .in("obra_id", obraIds)
+      .gte("data", inicio)
+      .lte("data", fim);
+
+    if (errDiarias) {
+      console.error("GET /relatorios/obras diarias error:", errDiarias);
+      return res.status(500).json({
+        ok: false,
+        error: "Falha ao buscar diárias do relatório",
+      });
+    }
+
+    // --------------------------------------------------
+    // 3) Ajustes das obras no período
+    // --------------------------------------------------
+    const { data: ajustes, error: errAjustes } = await supabaseAdmin
+      .from("lanc_diarias_ajustes")
+      .select("obra_id, funcionario_id, data_inicio, reembolso, adiantamento")
+      .in("obra_id", obraIds)
+      .gte("data_inicio", inicio)
+      .lte("data_inicio", fim);
+
+    if (errAjustes) {
+      console.error("GET /relatorios/obras ajustes error:", errAjustes);
+      return res.status(500).json({
+        ok: false,
+        error: "Falha ao buscar ajustes do relatório",
+      });
+    }
+
+    // --------------------------------------------------
+    // 4) Empreitas das obras no período
+    // --------------------------------------------------
+    const { data: empreitas, error: errEmpreitas } = await supabaseAdmin
+      .from("empreitas")
+      .select("obra_id, funcionario_id, data_pagamento, valor")
+      .in("obra_id", obraIds)
+      .gte("data_pagamento", inicio)
+      .lte("data_pagamento", fim);
+
+    if (errEmpreitas) {
+      console.error("GET /relatorios/obras empreitas error:", errEmpreitas);
+      return res.status(500).json({
+        ok: false,
+        error: "Falha ao buscar empreitas do relatório",
+      });
+    }
+
+    // --------------------------------------------------
+    // 5) Descobrir funcionários envolvidos
+    // --------------------------------------------------
+    const funcIdsSet = new Set();
+
+    (diarias || []).forEach((r) => {
+      if (r?.funcionario_id) funcIdsSet.add(r.funcionario_id);
+    });
+
+    (ajustes || []).forEach((r) => {
+      if (r?.funcionario_id) funcIdsSet.add(r.funcionario_id);
+    });
+
+    (empreitas || []).forEach((r) => {
+      if (r?.funcionario_id) funcIdsSet.add(r.funcionario_id);
+    });
+
+    const funcIds = [...funcIdsSet];
+
+    let funcionarios = [];
+
+    if (funcIds.length > 0) {
+      const { data: funcs, error: errFuncs } = await supabaseAdmin
+        .from("cadastro_func")
+        .select(
+          "id, nome, funcao, razao_social, titular_conta, cpf, rg, banco, agencia, conta, chave_pix, situacao",
+        )
+        .in("id", funcIds)
+        .order("nome", { ascending: true });
+
+      if (errFuncs) {
+        console.error("GET /relatorios/obras funcionarios error:", errFuncs);
+        return res.status(500).json({
+          ok: false,
+          error: "Falha ao listar funcionários do relatório",
+        });
+      }
+
+      funcionarios = funcs || [];
+    }
+
+    return res.json({
+      ok: true,
+      obras: obrasList,
+      funcionarios,
+      diarias: diarias || [],
+      ajustes: ajustes || [],
+      empreitas: empreitas || [],
+    });
+  } catch (err) {
+    console.error("GET /relatorios/obras exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
+// ==================================================
 // START
 // ==================================================
 const PORT = process.env.PORT || 3000;
