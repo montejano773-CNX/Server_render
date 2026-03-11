@@ -17,11 +17,8 @@ const allowedOrigins = (process.env.CORS_ORIGIN || "")
 app.use(
   cors({
     origin: (origin, callback) => {
-      // ✅ permite file:// e curl/postman
       if (!origin || origin === "null") return callback(null, true);
-
       if (allowedOrigins.length === 0) return callback(null, true);
-
       if (allowedOrigins.includes(origin)) return callback(null, true);
 
       console.log("❌ CORS BLOQUEADO:", origin, "permitidos:", allowedOrigins);
@@ -33,13 +30,11 @@ app.use(
   }),
 );
 
-// Preflight
 app.options("*", cors());
-
 app.use(express.json());
 
 // ==================================================
-// Helpers
+// HELPERS
 // ==================================================
 function isUuid(v) {
   if (!v) return false;
@@ -49,13 +44,9 @@ function isUuid(v) {
 }
 
 function normValorDiaria(v) {
-  // aceita: null/undefined/""
   if (v === undefined || v === null || v === "") return null;
-
-  // aceita string com vírgula (ex: "200,50")
   const s = String(v).trim().replace(",", ".");
   const n = Number(s);
-
   if (!Number.isFinite(n) || n < 0) return NaN;
   return n;
 }
@@ -74,6 +65,117 @@ function normChavePixTipo(body) {
   const s = String(v).trim();
   return s === "" ? null : s;
 }
+
+function deny(res, mensagem = "Sem permissão para esta ação") {
+  return res.status(403).json({ ok: false, error: mensagem });
+}
+
+function limparObjetoParaLog(obj) {
+  if (obj === null || obj === undefined) return null;
+
+  const proibidos = new Set([
+    "senha",
+    "password",
+    "access_token",
+    "refresh_token",
+    "token",
+    "authorization",
+  ]);
+
+  if (Array.isArray(obj)) {
+    return obj.map((item) => limparObjetoParaLog(item));
+  }
+
+  if (typeof obj === "object") {
+    const out = {};
+    for (const [key, value] of Object.entries(obj)) {
+      if (proibidos.has(String(key).toLowerCase())) continue;
+      out[key] = limparObjetoParaLog(value);
+    }
+    return out;
+  }
+
+  return obj;
+}
+
+function jsonIgual(a, b) {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+function gerarDiferencas(antes, depois) {
+  const a = limparObjetoParaLog(antes || {});
+  const d = limparObjetoParaLog(depois || {});
+
+  const keys = new Set([...Object.keys(a || {}), ...Object.keys(d || {})]);
+  const dif = {};
+
+  for (const key of keys) {
+    const va = a?.[key] ?? null;
+    const vd = d?.[key] ?? null;
+
+    if (!jsonIgual(va, vd)) {
+      dif[key] = {
+        antes: va,
+        depois: vd,
+      };
+    }
+  }
+
+  return Object.keys(dif).length ? dif : null;
+}
+
+function getClientIp(req) {
+  const xf = req.headers["x-forwarded-for"];
+  if (xf) return String(xf).split(",")[0].trim();
+  return req.ip || null;
+}
+
+async function registrarLog({
+  req,
+  usuario = null,
+  acao,
+  tabela = null,
+  registro_id = null,
+  antes = null,
+  depois = null,
+  observacao = null,
+}) {
+  try {
+    const antesLimpo = limparObjetoParaLog(antes);
+    const depoisLimpo = limparObjetoParaLog(depois);
+
+    const payload = {
+      usuario_id: usuario?.id || req?.authUser?.id || null,
+      usuario_nome: usuario?.nome || null,
+      usuario_email: usuario?.email || null,
+      nivel_acesso: usuario?.nivel_acesso || null,
+
+      acao: String(acao || "").trim(),
+      tabela: tabela ? String(tabela).trim() : null,
+      registro_id: registro_id ? String(registro_id).trim() : null,
+
+      antes: antesLimpo,
+      depois: depoisLimpo,
+      diferencas: gerarDiferencas(antesLimpo, depoisLimpo),
+
+      rota: req?.originalUrl || req?.url || null,
+      metodo: req?.method || null,
+
+      ip: getClientIp(req),
+      navegador: req?.headers?.["user-agent"] || null,
+      observacao: observacao ? String(observacao).trim() : null,
+    };
+
+    const { error } = await supabaseAdmin.from("logs_sistema").insert(payload);
+
+    if (error) {
+      console.error("Erro ao registrar log:", error);
+    }
+  } catch (err) {
+    console.error("Falha inesperada ao registrar log:", err);
+  }
+}
+
 // ==================================================
 // PERMISSÕES
 // ==================================================
@@ -113,10 +215,6 @@ function isConsulta(usuario) {
   return getNivel(usuario) === "consulta";
 }
 
-function deny(res, mensagem = "Sem permissão para esta ação") {
-  return res.status(403).json({ ok: false, error: mensagem });
-}
-
 async function encarregadoPodeAcessarObra(authUserId, obraId) {
   const { data, error } = await supabaseAdmin
     .from("cadastro_obra")
@@ -132,7 +230,7 @@ async function encarregadoPodeAcessarObra(authUserId, obraId) {
 async function getEquipeObraById(id) {
   const { data, error } = await supabaseAdmin
     .from("equipe_obra")
-    .select("id, obra_id, funcionario_id, situacao")
+    .select("*")
     .eq("id", id)
     .single();
 
@@ -143,16 +241,60 @@ async function getEquipeObraById(id) {
 async function getEmpreitaById(id) {
   const { data, error } = await supabaseAdmin
     .from("empreitas")
-    .select("id, obra_id, funcionario_id, data_pagamento, valor, descricao")
+    .select("*")
     .eq("id", id)
     .single();
 
   if (error) return null;
   return data;
 }
+
+async function getFuncionarioById(id) {
+  const { data, error } = await supabaseAdmin
+    .from("cadastro_func")
+    .select("*")
+    .eq("id", id)
+    .single();
+
+  if (error) return null;
+  return data;
+}
+
+async function getUsuarioById(id) {
+  const { data, error } = await supabaseAdmin
+    .from("cadastro_user")
+    .select("*")
+    .eq("id", id)
+    .single();
+
+  if (error) return null;
+  return data;
+}
+
+async function getObraById(id) {
+  const { data, error } = await supabaseAdmin
+    .from("cadastro_obra")
+    .select("*")
+    .eq("id", id)
+    .single();
+
+  if (error) return null;
+  return data;
+}
+
+async function getQuinzenaById(id) {
+  const { data, error } = await supabaseAdmin
+    .from("cadastro_quinzena")
+    .select("*")
+    .eq("id", id)
+    .single();
+
+  if (error) return null;
+  return data;
+}
+
 // --------------------------------------------------
-// Enriquecimento manual (sem depender de FK)
-// ✅ Agora também traz valor_diaria do cadastro_func
+// ENRIQUECIMENTO
 // --------------------------------------------------
 async function enrichEquipeRowsWithNames(rows) {
   const out = rows || [];
@@ -166,7 +308,6 @@ async function enrichEquipeRowsWithNames(rows) {
       funcionario_nome: null,
       funcionario_funcao: null,
       funcionario_valor_diaria: 0,
-      // compat p/ front antigo:
       valor_diaria: 0,
     }));
   }
@@ -197,7 +338,6 @@ async function enrichEquipeRowsWithNames(rows) {
       funcionario_nome: map[r.funcionario_id]?.nome || null,
       funcionario_funcao: map[r.funcionario_id]?.funcao || null,
       funcionario_valor_diaria: vd,
-      // ✅ compat p/ telas que ainda usam row.valor_diaria
       valor_diaria: vd,
     };
   });
@@ -266,14 +406,25 @@ app.get("/me", requireAuth, async (req, res) => {
         .json({ ok: false, error: "Perfil não encontrado no cadastro_user" });
     }
 
+    await registrarLog({
+      req,
+      usuario: data,
+      acao: "VIEW",
+      tabela: "cadastro_user",
+      registro_id: data.id,
+      depois: data,
+      observacao: "Usuário consultou o próprio perfil (/me)",
+    });
+
     return res.json({ ok: true, data });
   } catch (err) {
     console.error("GET /me exception:", err);
     return res.status(500).json({ ok: false, error: "Erro interno" });
   }
 });
+
 // ==================================================
-// USUÁRIOS RESPONSAVEIS (CRUD)
+// USUÁRIOS RESPONSÁVEIS
 // ==================================================
 app.get("/usuarios/responsaveis", requireAuth, async (req, res) => {
   try {
@@ -301,14 +452,24 @@ app.get("/usuarios/responsaveis", requireAuth, async (req, res) => {
       });
     }
 
+    await registrarLog({
+      req,
+      usuario,
+      acao: "LIST",
+      tabela: "cadastro_user",
+      depois: { total: (data || []).length },
+      observacao: "Listou usuários responsáveis",
+    });
+
     return res.json({ ok: true, data: data || [] });
   } catch (err) {
     console.error("GET /usuarios/responsaveis exception:", err);
     return res.status(500).json({ ok: false, error: "Erro interno" });
   }
 });
+
 // ==================================================
-// USUÁRIOS (CRUD) - (mantido igual ao seu)
+// USUÁRIOS CRUD
 // ==================================================
 app.get("/usuarios", requireAuth, async (req, res) => {
   try {
@@ -330,6 +491,15 @@ app.get("/usuarios", requireAuth, async (req, res) => {
         .json({ ok: false, error: "Falha ao listar usuários" });
     }
 
+    await registrarLog({
+      req,
+      usuario,
+      acao: "LIST",
+      tabela: "cadastro_user",
+      depois: { total: (data || []).length },
+      observacao: "Listou usuários",
+    });
+
     return res.json({ ok: true, data: data || [] });
   } catch (err) {
     console.error("GET /usuarios exception:", err);
@@ -340,12 +510,11 @@ app.get("/usuarios", requireAuth, async (req, res) => {
 app.get("/usuarios/:id", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
+    const id = req.params.id;
 
     if (!isAdmin(usuario)) {
       return deny(res, "Apenas administrador pode consultar usuário");
     }
-
-    const id = req.params.id;
 
     const { data, error } = await supabaseAdmin
       .from("cadastro_user")
@@ -359,6 +528,16 @@ app.get("/usuarios/:id", requireAuth, async (req, res) => {
         .status(404)
         .json({ ok: false, error: "Usuário não encontrado" });
     }
+
+    await registrarLog({
+      req,
+      usuario,
+      acao: "VIEW",
+      tabela: "cadastro_user",
+      registro_id: id,
+      depois: data,
+      observacao: "Consultou usuário",
+    });
 
     return res.json({ ok: true, data });
   } catch (err) {
@@ -374,10 +553,10 @@ app.post("/usuarios", requireAuth, async (req, res) => {
     if (!isAdmin(usuario)) {
       return deny(res, "Apenas administrador pode criar usuários");
     }
+
     const nome = (req.body?.nome || "").trim();
     const email = (req.body?.email || "").trim();
     const senha = (req.body?.senha || "").trim();
-
     const nivel_acesso = (req.body?.nivel_acesso || "encarregado").trim();
     const situacao = normSituacao(req.body?.situacao, "ativo");
     const observacao = req.body?.observacao
@@ -446,6 +625,18 @@ app.post("/usuarios", requireAuth, async (req, res) => {
         .json({ ok: false, error: "Falha ao salvar cadastro_user" });
     }
 
+    const novo = await getUsuarioById(newAuthId);
+
+    await registrarLog({
+      req,
+      usuario,
+      acao: "INSERT",
+      tabela: "cadastro_user",
+      registro_id: newAuthId,
+      depois: novo || row,
+      observacao: `Criou usuário ${nome}`,
+    });
+
     return res.status(201).json({ ok: true, data: { id: newAuthId } });
   } catch (err) {
     console.error("POST /usuarios exception:", err);
@@ -456,11 +647,13 @@ app.post("/usuarios", requireAuth, async (req, res) => {
 app.patch("/usuarios/:id", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
+    const id = req.params.id;
 
     if (!isAdmin(usuario)) {
       return deny(res, "Apenas administrador pode editar usuários");
     }
-    const id = req.params.id;
+
+    const antes = await getUsuarioById(id);
 
     const patch = {
       ...(req.body?.nome !== undefined
@@ -534,6 +727,19 @@ app.patch("/usuarios/:id", requireAuth, async (req, res) => {
       }
     }
 
+    const depois = await getUsuarioById(id);
+
+    await registrarLog({
+      req,
+      usuario,
+      acao: "PATCH",
+      tabela: "cadastro_user",
+      registro_id: id,
+      antes,
+      depois,
+      observacao: "Atualizou usuário",
+    });
+
     return res.json({ ok: true });
   } catch (err) {
     console.error("PATCH /usuarios/:id exception:", err);
@@ -544,11 +750,13 @@ app.patch("/usuarios/:id", requireAuth, async (req, res) => {
 app.delete("/usuarios/:id", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
+    const id = req.params.id;
 
     if (!isAdmin(usuario)) {
       return deny(res, "Apenas administrador pode excluir usuários");
     }
-    const id = req.params.id;
+
+    const antes = await getUsuarioById(id);
 
     const { error: delRowErr } = await supabaseAdmin
       .from("cadastro_user")
@@ -567,6 +775,19 @@ app.delete("/usuarios/:id", requireAuth, async (req, res) => {
 
     const { error: delAuthErr } = await supabaseAdmin.auth.admin.deleteUser(id);
 
+    await registrarLog({
+      req,
+      usuario,
+      acao: "DELETE",
+      tabela: "cadastro_user",
+      registro_id: id,
+      antes,
+      depois: null,
+      observacao: delAuthErr
+        ? "Usuário removido de cadastro_user, mas falhou no Auth"
+        : "Usuário excluído",
+    });
+
     if (delAuthErr) {
       console.error("DELETE /usuarios/:id delete Auth error:", delAuthErr);
       return res.status(200).json({
@@ -583,10 +804,7 @@ app.delete("/usuarios/:id", requireAuth, async (req, res) => {
 });
 
 // ==================================================
-// RELATÓRIOS (NOVO - DADOS CRUS)
-// - NÃO faz soma aqui
-// - Front (rel_pagamento.html) monta e soma
-// - Rota usada pela tela: /relatorios/pagamento
+// RELATÓRIO PAGAMENTO
 // ==================================================
 app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
   try {
@@ -600,6 +818,7 @@ app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
         "Apenas administrador, financeiro ou encarregado pode acessar relatório de pagamento",
       );
     }
+
     const inicio = String(req.query?.inicio || "").trim();
     const fim = String(req.query?.fim || "").trim();
 
@@ -610,7 +829,6 @@ app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
       });
     }
 
-    // 1) Funcionários (todos)
     const { data: funcionarios, error: errFunc } = await supabaseAdmin
       .from("cadastro_func")
       .select(
@@ -628,8 +846,16 @@ app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
     const funcList = funcionarios || [];
     const funcIds = funcList.map((f) => f.id);
 
-    // Se não tiver funcionários, devolve vazio já no formato esperado
     if (funcIds.length === 0) {
+      await registrarLog({
+        req,
+        usuario,
+        acao: "VIEW",
+        tabela: "relatorios_pagamento",
+        depois: { inicio, fim, total_funcionarios: 0 },
+        observacao: "Consultou relatório de pagamento sem funcionários",
+      });
+
       return res.json({
         ok: true,
         funcionarios: [],
@@ -639,7 +865,6 @@ app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
       });
     }
 
-    // 2) Diárias no período (dados crus)
     const { data: diarias, error: errDiarias } = await supabaseAdmin
       .from("lanc_diarias")
       .select("funcionario_id, data, qtd, valor_diaria_aplicado")
@@ -654,7 +879,6 @@ app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
         .json({ ok: false, error: "Falha ao buscar diárias" });
     }
 
-    // 3) Ajustes no período (dados crus)
     const { data: ajustes, error: errAj } = await supabaseAdmin
       .from("lanc_diarias_ajustes")
       .select("funcionario_id, data_inicio, reembolso, adiantamento")
@@ -670,7 +894,6 @@ app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
       });
     }
 
-    // 4) Empreitas no período (dados crus)
     const { data: empreitas, error: errEmp } = await supabaseAdmin
       .from("empreitas")
       .select("funcionario_id, data_pagamento, valor")
@@ -685,7 +908,22 @@ app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
         .json({ ok: false, error: "Falha ao buscar empreitas" });
     }
 
-    // ✅ Retorno exatamente no formato que o front espera
+    await registrarLog({
+      req,
+      usuario,
+      acao: "VIEW",
+      tabela: "relatorios_pagamento",
+      depois: {
+        inicio,
+        fim,
+        total_funcionarios: funcList.length,
+        total_diarias: (diarias || []).length,
+        total_ajustes: (ajustes || []).length,
+        total_empreitas: (empreitas || []).length,
+      },
+      observacao: "Consultou relatório de pagamento",
+    });
+
     return res.json({
       ok: true,
       funcionarios: funcList,
@@ -700,12 +938,12 @@ app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
 });
 
 // ==================================================
-// FUNCIONÁRIOS (CRUD) - public.cadastro_func
-// ✅ Deixei seu CRUD igual, só mantive valor_diaria no PUT (como você já tinha)
+// FUNCIONÁRIOS CRUD
 // ==================================================
 app.get("/funcionarios", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
+
     const { data, error } = await supabaseAdmin
       .from("cadastro_func")
       .select(
@@ -720,9 +958,124 @@ app.get("/funcionarios", requireAuth, async (req, res) => {
         .json({ ok: false, error: "Falha ao listar funcionários" });
     }
 
+    await registrarLog({
+      req,
+      usuario,
+      acao: "LIST",
+      tabela: "cadastro_func",
+      depois: { total: (data || []).length },
+      observacao: "Listou funcionários",
+    });
+
     return res.json({ ok: true, data: data || [] });
   } catch (err) {
     console.error("GET /funcionarios exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
+app.get("/funcionarios/:id", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    const id = req.params.id;
+
+    const { data, error } = await supabaseAdmin
+      .from("cadastro_func")
+      .select("*")
+      .eq("id", id)
+      .single();
+
+    if (error) {
+      console.error("GET /funcionarios/:id error:", error);
+      return res
+        .status(404)
+        .json({ ok: false, error: "Funcionário não encontrado" });
+    }
+
+    await registrarLog({
+      req,
+      usuario,
+      acao: "VIEW",
+      tabela: "cadastro_func",
+      registro_id: id,
+      depois: data,
+      observacao: "Consultou funcionário",
+    });
+
+    return res.json({ ok: true, data });
+  } catch (err) {
+    console.error("GET /funcionarios/:id exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
+app.post("/funcionarios", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+
+    if (!(isAdmin(usuario) || isFinanceiro(usuario))) {
+      return deny(
+        res,
+        "Apenas administrador ou financeiro pode cadastrar funcionário",
+      );
+    }
+
+    const vdi = normValorDiaria(req.body?.valor_diaria);
+    if (Number.isNaN(vdi)) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "valor_diaria inválido" });
+    }
+
+    const payload = {
+      nome: (req.body?.nome || "").trim(),
+      funcao: req.body?.funcao?.trim?.() || null,
+      valor_diaria: vdi ?? 0,
+      cpf: req.body?.cpf ? String(req.body.cpf).replace(/\D/g, "") : null,
+      rg: req.body?.rg ? String(req.body.rg).trim() : null,
+      situacao: normSituacao(req.body?.situacao, "ativo"),
+      razao_social: req.body?.razao_social?.trim?.() || null,
+      titular_conta: req.body?.titular_conta?.trim?.() || null,
+      banco: req.body?.banco?.trim?.() || null,
+      agencia: req.body?.agencia?.trim?.() || null,
+      conta: req.body?.conta?.trim?.() || null,
+      chave_pix_tipo: normChavePixTipo(req.body),
+      chave_pix: req.body?.chave_pix?.trim?.() || null,
+      observacao: req.body?.observacao?.trim?.() || null,
+    };
+
+    if (!payload.nome) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "Informe o nome do funcionário" });
+    }
+
+    const { data, error } = await supabaseAdmin
+      .from("cadastro_func")
+      .insert(payload)
+      .select("id")
+      .single();
+
+    if (error) {
+      console.error("POST /funcionarios error:", error);
+      return res.status(500).json({ ok: false, error: error.message });
+    }
+
+    const novo = await getFuncionarioById(data.id);
+
+    await registrarLog({
+      req,
+      usuario,
+      acao: "INSERT",
+      tabela: "cadastro_func",
+      registro_id: data.id,
+      depois: novo || payload,
+      observacao: `Criou funcionário ${payload.nome}`,
+    });
+
+    return res.status(201).json({ ok: true, data });
+  } catch (err) {
+    console.error("POST /funcionarios exception:", err);
     return res.status(500).json({ ok: false, error: "Erro interno" });
   }
 });
@@ -734,7 +1087,9 @@ app.put("/funcionarios/:id", requireAuth, async (req, res) => {
     if (!isAdmin(usuario)) {
       return deny(res, "Apenas administrador pode editar funcionário");
     }
+
     const id = req.params.id;
+    const antes = await getFuncionarioById(id);
 
     const nome = String(req.body?.nome || "").trim();
     if (!nome) {
@@ -766,10 +1121,7 @@ app.put("/funcionarios/:id", requireAuth, async (req, res) => {
       banco: req.body?.banco ? String(req.body.banco).trim() : null,
       agencia: req.body?.agencia ? String(req.body.agencia).trim() : null,
       conta: req.body?.conta ? String(req.body.conta).trim() : null,
-
-      // ✅ AJUSTE (1/3): usa helper
       chave_pix_tipo: normChavePixTipo(req.body),
-
       chave_pix: req.body?.chave_pix ? String(req.body.chave_pix).trim() : null,
       observacao: req.body?.observacao
         ? String(req.body.observacao).trim()
@@ -788,94 +1140,22 @@ app.put("/funcionarios/:id", requireAuth, async (req, res) => {
         .json({ ok: false, error: "Falha ao atualizar funcionário" });
     }
 
+    const depois = await getFuncionarioById(id);
+
+    await registrarLog({
+      req,
+      usuario,
+      acao: "UPDATE",
+      tabela: "cadastro_func",
+      registro_id: id,
+      antes,
+      depois,
+      observacao: "Atualizou funcionário",
+    });
+
     return res.json({ ok: true });
   } catch (err) {
     console.error("PUT /funcionarios/:id exception:", err);
-    return res.status(500).json({ ok: false, error: "Erro interno" });
-  }
-});
-
-app.get("/funcionarios/:id", requireAuth, async (req, res) => {
-  try {
-    const id = req.params.id;
-
-    const { data, error } = await supabaseAdmin
-      .from("cadastro_func")
-      .select("*")
-      .eq("id", id)
-      .single();
-
-    if (error) {
-      console.error("GET /funcionarios/:id error:", error);
-      return res
-        .status(404)
-        .json({ ok: false, error: "Funcionário não encontrado" });
-    }
-
-    return res.json({ ok: true, data });
-  } catch (err) {
-    console.error("GET /funcionarios/:id exception:", err);
-    return res.status(500).json({ ok: false, error: "Erro interno" });
-  }
-});
-
-app.post("/funcionarios", requireAuth, async (req, res) => {
-  try {
-    const usuario = await getUsuarioLogado(req.authUser.id);
-
-    if (!(isAdmin(usuario) || isFinanceiro(usuario))) {
-      return deny(
-        res,
-        "Apenas administrador ou financeiro pode cadastrar funcionário",
-      );
-    }
-    const vdi = normValorDiaria(req.body?.valor_diaria);
-    if (Number.isNaN(vdi)) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "valor_diaria inválido" });
-    }
-
-    const payload = {
-      nome: (req.body?.nome || "").trim(),
-      funcao: req.body?.funcao?.trim?.() || null,
-
-      // ✅ salvar valor_diaria (se vier ""/null -> null, se vier 0 -> 0)
-      valor_diaria: vdi ?? 0,
-
-      cpf: req.body?.cpf ? String(req.body.cpf).replace(/\D/g, "") : null,
-      rg: req.body?.rg ? String(req.body.rg).trim() : null,
-      situacao: normSituacao(req.body?.situacao, "ativo"),
-      razao_social: req.body?.razao_social?.trim?.() || null,
-      titular_conta: req.body?.titular_conta?.trim?.() || null,
-      banco: req.body?.banco?.trim?.() || null,
-      agencia: req.body?.agencia?.trim?.() || null,
-      conta: req.body?.conta?.trim?.() || null,
-      chave_pix_tipo: normChavePixTipo(req.body),
-      chave_pix: req.body?.chave_pix?.trim?.() || null,
-      observacao: req.body?.observacao?.trim?.() || null,
-    };
-
-    if (!payload.nome) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "Informe o nome do funcionário" });
-    }
-
-    const { data, error } = await supabaseAdmin
-      .from("cadastro_func")
-      .insert(payload)
-      .select("id")
-      .single();
-
-    if (error) {
-      console.error("POST /funcionarios error:", error);
-      return res.status(500).json({ ok: false, error: error.message });
-    }
-
-    return res.status(201).json({ ok: true, data });
-  } catch (err) {
-    console.error("POST /funcionarios exception:", err);
     return res.status(500).json({ ok: false, error: "Erro interno" });
   }
 });
@@ -887,7 +1167,9 @@ app.patch("/funcionarios/:id", requireAuth, async (req, res) => {
     if (!isAdmin(usuario)) {
       return deny(res, "Apenas administrador pode editar funcionário");
     }
+
     const id = req.params.id;
+    const antes = await getFuncionarioById(id);
 
     const patch = {
       ...(req.body?.nome !== undefined
@@ -928,13 +1210,10 @@ app.patch("/funcionarios/:id", requireAuth, async (req, res) => {
       ...(req.body?.conta !== undefined
         ? { conta: req.body.conta ? String(req.body.conta).trim() : null }
         : {}),
-
-      // ✅ AJUSTE (3/3): usa helper quando vier qualquer um dos campos
       ...(req.body?.chave_pix_tipo !== undefined ||
       req.body?.tipo_chave_pix !== undefined
         ? { chave_pix_tipo: normChavePixTipo(req.body) }
         : {}),
-
       ...(req.body?.chave_pix !== undefined
         ? {
             chave_pix: req.body.chave_pix
@@ -967,6 +1246,19 @@ app.patch("/funcionarios/:id", requireAuth, async (req, res) => {
         .json({ ok: false, error: "Falha ao atualizar funcionário" });
     }
 
+    const depois = await getFuncionarioById(id);
+
+    await registrarLog({
+      req,
+      usuario,
+      acao: "PATCH",
+      tabela: "cadastro_func",
+      registro_id: id,
+      antes,
+      depois,
+      observacao: "Atualizou parcialmente funcionário",
+    });
+
     return res.json({ ok: true });
   } catch (err) {
     console.error("PATCH /funcionarios/:id exception:", err);
@@ -981,7 +1273,9 @@ app.delete("/funcionarios/:id", requireAuth, async (req, res) => {
     if (!isAdmin(usuario)) {
       return deny(res, "Apenas administrador pode excluir funcionário");
     }
+
     const id = req.params.id;
+    const antes = await getFuncionarioById(id);
 
     const { error } = await supabaseAdmin
       .from("cadastro_func")
@@ -995,6 +1289,17 @@ app.delete("/funcionarios/:id", requireAuth, async (req, res) => {
         .json({ ok: false, error: "Falha ao deletar funcionário" });
     }
 
+    await registrarLog({
+      req,
+      usuario,
+      acao: "DELETE",
+      tabela: "cadastro_func",
+      registro_id: id,
+      antes,
+      depois: null,
+      observacao: "Excluiu funcionário",
+    });
+
     return res.json({ ok: true });
   } catch (err) {
     console.error("DELETE /funcionarios/:id exception:", err);
@@ -1003,11 +1308,8 @@ app.delete("/funcionarios/:id", requireAuth, async (req, res) => {
 });
 
 // ==================================================
-// EQUIPE POR OBRA (CRUD) - public.equipe_obra
-// ✅ SEM valor_diaria em equipe_obra
+// EQUIPE POR OBRA
 // ==================================================
-
-// LISTAR EQUIPE DA OBRA
 app.get("/equipe-obra", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
@@ -1049,6 +1351,16 @@ app.get("/equipe-obra", requireAuth, async (req, res) => {
     }
 
     const enriched = await enrichEquipeRowsWithNames(data || []);
+
+    await registrarLog({
+      req,
+      usuario,
+      acao: "LIST",
+      tabela: "equipe_obra",
+      depois: { obra_id: obraId, total: enriched.length },
+      observacao: "Listou equipe da obra",
+    });
+
     return res.json({ ok: true, data: enriched });
   } catch (err) {
     console.error("GET /equipe-obra exception:", err);
@@ -1056,8 +1368,6 @@ app.get("/equipe-obra", requireAuth, async (req, res) => {
   }
 });
 
-// ADICIONAR / ATUALIZAR (UPSERT MANUAL)
-// ✅ SEM valor_diaria
 app.post("/equipe-obra", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
@@ -1075,6 +1385,7 @@ app.post("/equipe-obra", requireAuth, async (req, res) => {
     ) {
       return deny(res);
     }
+
     const obra_id = String(req.body?.obra_id || "").trim();
     const funcionario_id = String(req.body?.funcionario_id || "").trim();
 
@@ -1088,12 +1399,14 @@ app.post("/equipe-obra", requireAuth, async (req, res) => {
         .status(400)
         .json({ ok: false, error: "funcionario_id inválido (UUID)" });
     }
+
     if (isEncarregado(usuario)) {
       const pode = await encarregadoPodeAcessarObra(authId, obra_id);
       if (!pode) {
         return deny(res, "Você só pode alterar equipe das suas próprias obras");
       }
     }
+
     const situacao = normSituacao(req.body?.situacao, "ativo");
     const observacao = req.body?.observacao
       ? String(req.body.observacao).trim()
@@ -1101,7 +1414,7 @@ app.post("/equipe-obra", requireAuth, async (req, res) => {
 
     const { data: existente, error: selErr } = await supabaseAdmin
       .from("equipe_obra")
-      .select("id")
+      .select("*")
       .eq("obra_id", obra_id)
       .eq("funcionario_id", funcionario_id)
       .order("created_at", { ascending: false })
@@ -1116,6 +1429,7 @@ app.post("/equipe-obra", requireAuth, async (req, res) => {
 
     if (existente && existente.length > 0) {
       const id = existente[0].id;
+      const antes = existente[0];
 
       const { error: upErr } = await supabaseAdmin
         .from("equipe_obra")
@@ -1128,6 +1442,19 @@ app.post("/equipe-obra", requireAuth, async (req, res) => {
           .status(500)
           .json({ ok: false, error: "Falha ao atualizar vínculo" });
       }
+
+      const depois = await getEquipeObraById(id);
+
+      await registrarLog({
+        req,
+        usuario,
+        acao: "UPDATE",
+        tabela: "equipe_obra",
+        registro_id: id,
+        antes,
+        depois,
+        observacao: "Atualizou vínculo equipe_obra via upsert manual",
+      });
 
       return res.status(200).json({ ok: true, data: { id, updated: true } });
     } else {
@@ -1144,6 +1471,18 @@ app.post("/equipe-obra", requireAuth, async (req, res) => {
           .json({ ok: false, error: "Falha ao criar vínculo" });
       }
 
+      const depois = await getEquipeObraById(ins.id);
+
+      await registrarLog({
+        req,
+        usuario,
+        acao: "INSERT",
+        tabela: "equipe_obra",
+        registro_id: ins.id,
+        depois,
+        observacao: "Criou vínculo equipe_obra",
+      });
+
       return res.status(201).json({ ok: true, data: ins });
     }
   } catch (err) {
@@ -1152,7 +1491,6 @@ app.post("/equipe-obra", requireAuth, async (req, res) => {
   }
 });
 
-// REMOVER (INATIVAR)
 app.delete("/equipe-obra/:id", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
@@ -1202,15 +1540,28 @@ app.delete("/equipe-obra/:id", requireAuth, async (req, res) => {
         .json({ ok: false, error: "Falha ao remover vínculo" });
     }
 
+    const depois = await getEquipeObraById(id);
+
+    await registrarLog({
+      req,
+      usuario,
+      acao: "DELETE",
+      tabela: "equipe_obra",
+      registro_id: id,
+      antes: vinculo,
+      depois,
+      observacao: "Inativou vínculo equipe_obra",
+    });
+
     return res.json({ ok: true });
   } catch (err) {
     console.error("DELETE /equipe-obra/:id exception:", err);
     return res.status(500).json({ ok: false, error: "Erro interno" });
   }
 });
+
 // =====================================================
-// DIÁRIAS - SELECT + UPSERT (lanc_diarias)
-// (mantido igual ao seu)
+// DIÁRIAS
 // =====================================================
 app.get("/lanc-diarias", requireAuth, async (req, res) => {
   try {
@@ -1259,6 +1610,15 @@ app.get("/lanc-diarias", requireAuth, async (req, res) => {
         .json({ ok: false, error: "Erro ao buscar diárias" });
     }
 
+    await registrarLog({
+      req,
+      usuario,
+      acao: "LIST",
+      tabela: "lanc_diarias",
+      depois: { obra_id, data_inicio, data_fim, total: (data || []).length },
+      observacao: "Listou diárias por período",
+    });
+
     return res.json({ ok: true, data: data || [] });
   } catch (e) {
     console.error("GET /lanc-diarias exception:", e);
@@ -1277,6 +1637,7 @@ app.post("/lanc-diarias", requireAuth, async (req, res) => {
         "Apenas administrador ou encarregado pode lançar diárias",
       );
     }
+
     const registros = req.body?.registros;
     if (!Array.isArray(registros) || registros.length === 0) {
       return res
@@ -1304,9 +1665,9 @@ app.post("/lanc-diarias", requireAuth, async (req, res) => {
 
       return { obra_id, funcionario_id, data, qtd, valor_diaria_aplicado: vda };
     });
+
     if (isEncarregado(usuario)) {
       const obraIds = [...new Set(normalized.map((r) => r.obra_id))];
-
       for (const obraId of obraIds) {
         const pode = await encarregadoPodeAcessarObra(authId, obraId);
         if (!pode) {
@@ -1317,6 +1678,9 @@ app.post("/lanc-diarias", requireAuth, async (req, res) => {
         }
       }
     }
+
+    const antes = null;
+
     const { error } = await supabaseAdmin
       .from("lanc_diarias")
       .upsert(normalized, { onConflict: "obra_id,funcionario_id,data" });
@@ -1328,6 +1692,16 @@ app.post("/lanc-diarias", requireAuth, async (req, res) => {
         .json({ ok: false, error: "Erro ao salvar diárias" });
     }
 
+    await registrarLog({
+      req,
+      usuario,
+      acao: "UPSERT",
+      tabela: "lanc_diarias",
+      depois: normalized,
+      antes,
+      observacao: `Salvou ${normalized.length} registro(s) de diárias`,
+    });
+
     return res.json({ ok: true });
   } catch (e) {
     console.error("POST /lanc-diarias exception:", e);
@@ -1338,7 +1712,7 @@ app.post("/lanc-diarias", requireAuth, async (req, res) => {
 });
 
 // =====================================================
-// AJUSTES DO PERÍODO (lanc_diarias_ajustes) (mantido igual)
+// AJUSTES DIÁRIAS
 // =====================================================
 app.get("/diarias-ajustes", requireAuth, async (req, res) => {
   try {
@@ -1354,13 +1728,6 @@ app.get("/diarias-ajustes", requireAuth, async (req, res) => {
       });
     }
 
-    const { data, error } = await supabaseAdmin
-      .from("lanc_diarias_ajustes")
-      .select(
-        "obra_id, funcionario_id, data_inicio, reembolso, adiantamento, observacao, valor",
-      )
-      .eq("obra_id", obra_id)
-      .eq("data_inicio", data_inicio);
     if (!(isAdmin(usuario) || isEncarregado(usuario))) {
       return deny(
         res,
@@ -1377,12 +1744,30 @@ app.get("/diarias-ajustes", requireAuth, async (req, res) => {
         );
       }
     }
+
+    const { data, error } = await supabaseAdmin
+      .from("lanc_diarias_ajustes")
+      .select(
+        "obra_id, funcionario_id, data_inicio, reembolso, adiantamento, observacao, valor",
+      )
+      .eq("obra_id", obra_id)
+      .eq("data_inicio", data_inicio);
+
     if (error) {
       console.error("GET /diarias-ajustes error:", error);
       return res
         .status(500)
         .json({ ok: false, error: "Erro ao buscar ajustes" });
     }
+
+    await registrarLog({
+      req,
+      usuario,
+      acao: "LIST",
+      tabela: "lanc_diarias_ajustes",
+      depois: { obra_id, data_inicio, total: (data || []).length },
+      observacao: "Listou ajustes de diárias",
+    });
 
     return res.json({ ok: true, data: data || [] });
   } catch (e) {
@@ -1402,6 +1787,7 @@ app.post("/diarias-ajustes", requireAuth, async (req, res) => {
         "Apenas administrador ou encarregado pode salvar ajustes de diárias",
       );
     }
+
     const ajustes = req.body?.ajustes;
     if (!Array.isArray(ajustes)) {
       return res
@@ -1457,9 +1843,9 @@ app.post("/diarias-ajustes", requireAuth, async (req, res) => {
         valor,
       };
     });
+
     if (isEncarregado(usuario)) {
       const obraIds = [...new Set(normalized.map((a) => a.obra_id))];
-
       for (const obraId of obraIds) {
         const pode = await encarregadoPodeAcessarObra(authId, obraId);
         if (!pode) {
@@ -1470,6 +1856,7 @@ app.post("/diarias-ajustes", requireAuth, async (req, res) => {
         }
       }
     }
+
     const { error } = await supabaseAdmin
       .from("lanc_diarias_ajustes")
       .upsert(normalized, { onConflict: "obra_id,funcionario_id,data_inicio" });
@@ -1481,6 +1868,15 @@ app.post("/diarias-ajustes", requireAuth, async (req, res) => {
         .json({ ok: false, error: error.message || "Erro ao salvar ajustes" });
     }
 
+    await registrarLog({
+      req,
+      usuario,
+      acao: "UPSERT",
+      tabela: "lanc_diarias_ajustes",
+      depois: normalized,
+      observacao: `Salvou ${normalized.length} ajuste(s) de diárias`,
+    });
+
     return res.json({ ok: true });
   } catch (e) {
     console.error("POST /diarias-ajustes exception:", e);
@@ -1491,8 +1887,7 @@ app.post("/diarias-ajustes", requireAuth, async (req, res) => {
 });
 
 // =====================================================
-// ✅ FUNCIONÁRIOS VINCULADOS (para extras no diarias.html)
-// ✅ NÃO usa equipe_obra.valor_diaria (não existe)
+// FUNCIONÁRIOS VINCULADOS
 // =====================================================
 app.get("/funcionarios-vinculados", requireAuth, async (req, res) => {
   try {
@@ -1524,7 +1919,6 @@ app.get("/funcionarios-vinculados", requireAuth, async (req, res) => {
       }
 
       const obraIds = (obrasDoEncarregado || []).map((o) => o.id);
-
       if (!obraIds.length) {
         return res.json({ ok: true, data: [] });
       }
@@ -1554,6 +1948,15 @@ app.get("/funcionarios-vinculados", requireAuth, async (req, res) => {
       situacao: r.situacao,
     }));
 
+    await registrarLog({
+      req,
+      usuario,
+      acao: "LIST",
+      tabela: "equipe_obra",
+      depois: { total: out.length },
+      observacao: "Listou funcionários vinculados",
+    });
+
     return res.json({ ok: true, data: out });
   } catch (e) {
     console.error("GET /funcionarios-vinculados exception:", e);
@@ -1561,10 +1964,6 @@ app.get("/funcionarios-vinculados", requireAuth, async (req, res) => {
   }
 });
 
-// =====================================================
-// ✅ /equipe-obra/todas (se você usa em algum lugar)
-// ✅ NÃO usa equipe_obra.valor_diaria
-// =====================================================
 app.get("/equipe-obra/todas", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
@@ -1575,6 +1974,7 @@ app.get("/equipe-obra/todas", requireAuth, async (req, res) => {
         "Apenas administrador ou financeiro pode ver todas as equipes",
       );
     }
+
     const { data, error } = await supabaseAdmin
       .from("equipe_obra")
       .select("obra_id, funcionario_id, situacao");
@@ -1593,16 +1993,21 @@ app.get("/equipe-obra/todas", requireAuth, async (req, res) => {
       obra_id: r.obra_id,
       funcionario_id: r.funcionario_id,
       situacao: r.situacao,
-
       obra_nome: r.obra_nome || null,
       obra_situacao: r.obra_situacao || null,
-
       funcionario_nome: r.funcionario_nome || null,
       funcionario_funcao: r.funcionario_funcao || null,
-
-      // ✅ diária vem do cadastro_func
       valor_diaria: Number(r.funcionario_valor_diaria || r.valor_diaria || 0),
     }));
+
+    await registrarLog({
+      req,
+      usuario,
+      acao: "LIST",
+      tabela: "equipe_obra",
+      depois: { total: enriched.length },
+      observacao: "Listou todas as equipes",
+    });
 
     return res.json({ ok: true, data: enriched });
   } catch (e) {
@@ -1612,7 +2017,7 @@ app.get("/equipe-obra/todas", requireAuth, async (req, res) => {
 });
 
 // ==================================================
-// EMPREITAS (CRUD) - (mantido igual ao seu)
+// EMPREITAS CRUD
 // ==================================================
 app.get("/empreitas", requireAuth, async (req, res) => {
   try {
@@ -1678,7 +2083,6 @@ app.get("/empreitas", requireAuth, async (req, res) => {
       }
 
       const obraIds = (obrasDoEncarregado || []).map((o) => o.id);
-
       if (!obraIds.length) {
         return res.json({ ok: true, data: [] });
       }
@@ -1698,6 +2102,21 @@ app.get("/empreitas", requireAuth, async (req, res) => {
         .json({ ok: false, error: "Falha ao listar empreitas" });
     }
 
+    await registrarLog({
+      req,
+      usuario,
+      acao: "LIST",
+      tabela: "empreitas",
+      depois: {
+        total: (data || []).length,
+        inicio: inicio || null,
+        fim: fim || null,
+        obra_id: obra_id || null,
+        funcionario_id: funcionario_id || null,
+      },
+      observacao: "Listou empreitas",
+    });
+
     return res.json({ ok: true, data: data || [] });
   } catch (err) {
     console.error("GET /empreitas exception:", err);
@@ -1705,7 +2124,6 @@ app.get("/empreitas", requireAuth, async (req, res) => {
   }
 });
 
-// (resto empreitas CRUD igual ao seu...)
 app.get("/empreitas/:id", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
@@ -1742,6 +2160,16 @@ app.get("/empreitas/:id", requireAuth, async (req, res) => {
       }
     }
 
+    await registrarLog({
+      req,
+      usuario,
+      acao: "VIEW",
+      tabela: "empreitas",
+      registro_id: id,
+      depois: data,
+      observacao: "Consultou empreita",
+    });
+
     return res.json({ ok: true, data });
   } catch (err) {
     console.error("GET /empreitas/:id exception:", err);
@@ -1760,6 +2188,7 @@ app.post("/empreitas", requireAuth, async (req, res) => {
         "Apenas administrador ou encarregado pode lançar empreita",
       );
     }
+
     const obra_id = req.body?.obra_id;
     const funcionario_id = req.body?.funcionario_id;
     const data_pagamento = req.body?.data_pagamento;
@@ -1773,6 +2202,7 @@ app.post("/empreitas", requireAuth, async (req, res) => {
         .status(400)
         .json({ ok: false, error: "obra_id é obrigatório (UUID)" });
     }
+
     if (isEncarregado(usuario)) {
       const pode = await encarregadoPodeAcessarObra(authId, obra_id);
       if (!pode) {
@@ -1782,11 +2212,13 @@ app.post("/empreitas", requireAuth, async (req, res) => {
         );
       }
     }
+
     if (!isUuid(funcionario_id)) {
       return res
         .status(400)
         .json({ ok: false, error: "funcionario_id é obrigatório (UUID)" });
     }
+
     if (!data_pagamento) {
       return res.status(400).json({
         ok: false,
@@ -1821,12 +2253,25 @@ app.post("/empreitas", requireAuth, async (req, res) => {
         .json({ ok: false, error: "Falha ao salvar empreita" });
     }
 
+    const depois = await getEmpreitaById(data.id);
+
+    await registrarLog({
+      req,
+      usuario,
+      acao: "INSERT",
+      tabela: "empreitas",
+      registro_id: data.id,
+      depois,
+      observacao: "Criou empreita",
+    });
+
     return res.status(201).json({ ok: true, data });
   } catch (err) {
     console.error("POST /empreitas exception:", err);
     return res.status(500).json({ ok: false, error: "Erro interno" });
   }
 });
+
 app.put("/empreitas/:id", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
@@ -1844,15 +2289,15 @@ app.put("/empreitas/:id", requireAuth, async (req, res) => {
       );
     }
 
-    const empreita = await getEmpreitaById(id);
-    if (!empreita) {
+    const antes = await getEmpreitaById(id);
+    if (!antes) {
       return res
         .status(404)
         .json({ ok: false, error: "Empreita não encontrada" });
     }
 
     if (isEncarregado(usuario)) {
-      const pode = await encarregadoPodeAcessarObra(authId, empreita.obra_id);
+      const pode = await encarregadoPodeAcessarObra(authId, antes.obra_id);
       if (!pode) {
         return deny(
           res,
@@ -1925,12 +2370,26 @@ app.put("/empreitas/:id", requireAuth, async (req, res) => {
         .json({ ok: false, error: "Falha ao atualizar empreita" });
     }
 
+    const depois = await getEmpreitaById(id);
+
+    await registrarLog({
+      req,
+      usuario,
+      acao: "UPDATE",
+      tabela: "empreitas",
+      registro_id: id,
+      antes,
+      depois,
+      observacao: "Atualizou empreita",
+    });
+
     return res.json({ ok: true });
   } catch (err) {
     console.error("PUT /empreitas/:id exception:", err);
     return res.status(500).json({ ok: false, error: "Erro interno" });
   }
 });
+
 app.delete("/empreitas/:id", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
@@ -1948,15 +2407,15 @@ app.delete("/empreitas/:id", requireAuth, async (req, res) => {
       );
     }
 
-    const empreita = await getEmpreitaById(id);
-    if (!empreita) {
+    const antes = await getEmpreitaById(id);
+    if (!antes) {
       return res
         .status(404)
         .json({ ok: false, error: "Empreita não encontrada" });
     }
 
     if (isEncarregado(usuario)) {
-      const pode = await encarregadoPodeAcessarObra(authId, empreita.obra_id);
+      const pode = await encarregadoPodeAcessarObra(authId, antes.obra_id);
       if (!pode) {
         return deny(
           res,
@@ -1977,14 +2436,26 @@ app.delete("/empreitas/:id", requireAuth, async (req, res) => {
         .json({ ok: false, error: "Falha ao excluir empreita" });
     }
 
+    await registrarLog({
+      req,
+      usuario,
+      acao: "DELETE",
+      tabela: "empreitas",
+      registro_id: id,
+      antes,
+      depois: null,
+      observacao: "Excluiu empreita",
+    });
+
     return res.json({ ok: true });
   } catch (err) {
     console.error("DELETE /empreitas/:id exception:", err);
     return res.status(500).json({ ok: false, error: "Erro interno" });
   }
 });
+
 // ==================================================
-// OBRAS (CRUD) - (mantido igual ao seu)
+// OBRAS CRUD
 // ==================================================
 app.get("/obras", requireAuth, async (req, res) => {
   try {
@@ -2013,6 +2484,15 @@ app.get("/obras", requireAuth, async (req, res) => {
         .json({ ok: false, error: "Falha ao listar obras" });
     }
 
+    await registrarLog({
+      req,
+      usuario,
+      acao: "LIST",
+      tabela: "cadastro_obra",
+      depois: { total: (data || []).length },
+      observacao: "Listou obras",
+    });
+
     return res.json({ ok: true, data: data || [] });
   } catch (err) {
     console.error("GET /obras exception:", err);
@@ -2030,6 +2510,7 @@ app.get("/obras/todas", requireAuth, async (req, res) => {
         "Apenas administrador ou financeiro pode ver todas as obras",
       );
     }
+
     const { data, error } = await supabaseAdmin
       .from("cadastro_obra")
       .select("id, nome, cidade, uf, situacao, responsavel")
@@ -2042,12 +2523,66 @@ app.get("/obras/todas", requireAuth, async (req, res) => {
         .json({ ok: false, error: "Falha ao listar obras (todas)" });
     }
 
+    await registrarLog({
+      req,
+      usuario,
+      acao: "LIST",
+      tabela: "cadastro_obra",
+      depois: { total: (data || []).length },
+      observacao: "Listou todas as obras",
+    });
+
     return res.json({ ok: true, data: data || [] });
   } catch (err) {
     console.error("GET /obras/todas exception:", err);
     return res.status(500).json({ ok: false, error: "Erro interno" });
   }
 });
+
+// GET /obras/:id
+app.get("/obras/:id", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    const authId = req.authUser.id;
+    const id = String(req.params.id || "").trim();
+
+    if (!isUuid(id)) {
+      return res.status(400).json({ ok: false, error: "id inválido (UUID)" });
+    }
+
+    if (isConsulta(usuario)) {
+      return deny(res, "Usuário somente consulta não acessa obra");
+    }
+
+    const data = await getObraById(id);
+    if (!data) {
+      return res.status(404).json({ ok: false, error: "Obra não encontrada" });
+    }
+
+    if (isEncarregado(usuario)) {
+      const pode = await encarregadoPodeAcessarObra(authId, id);
+      if (!pode) {
+        return deny(res, "Você só pode acessar suas próprias obras");
+      }
+    }
+
+    await registrarLog({
+      req,
+      usuario,
+      acao: "VIEW",
+      tabela: "cadastro_obra",
+      registro_id: id,
+      depois: data,
+      observacao: "Consultou obra",
+    });
+
+    return res.json({ ok: true, data });
+  } catch (err) {
+    console.error("GET /obras/:id exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
 app.post("/obras", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
@@ -2128,6 +2663,18 @@ app.post("/obras", requireAuth, async (req, res) => {
       });
     }
 
+    const depois = await getObraById(data.id);
+
+    await registrarLog({
+      req,
+      usuario,
+      acao: "INSERT",
+      tabela: "cadastro_obra",
+      registro_id: data.id,
+      depois,
+      observacao: `Criou obra ${nome}`,
+    });
+
     return res.status(201).json({ ok: true, data });
   } catch (err) {
     console.error("POST /obras exception:", err);
@@ -2144,10 +2691,11 @@ app.put("/obras/:id", requireAuth, async (req, res) => {
     }
 
     const id = String(req.params.id || "").trim();
-
     if (!isUuid(id)) {
       return res.status(400).json({ ok: false, error: "id inválido (UUID)" });
     }
+
+    const antes = await getObraById(id);
 
     const nome = String(req.body?.nome || "").trim();
     const endereco = req.body?.endereco
@@ -2217,12 +2765,26 @@ app.put("/obras/:id", requireAuth, async (req, res) => {
       });
     }
 
+    const depois = await getObraById(id);
+
+    await registrarLog({
+      req,
+      usuario,
+      acao: "UPDATE",
+      tabela: "cadastro_obra",
+      registro_id: id,
+      antes,
+      depois,
+      observacao: "Atualizou obra",
+    });
+
     return res.json({ ok: true });
   } catch (err) {
     console.error("PUT /obras/:id exception:", err);
     return res.status(500).json({ ok: false, error: "Erro interno" });
   }
 });
+
 app.patch("/obras/:id", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
@@ -2232,10 +2794,11 @@ app.patch("/obras/:id", requireAuth, async (req, res) => {
     }
 
     const id = String(req.params.id || "").trim();
-
     if (!isUuid(id)) {
       return res.status(400).json({ ok: false, error: "id inválido (UUID)" });
     }
+
+    const antes = await getObraById(id);
 
     const patch = {
       ...(req.body?.nome !== undefined
@@ -2316,12 +2879,26 @@ app.patch("/obras/:id", requireAuth, async (req, res) => {
       });
     }
 
+    const depois = await getObraById(id);
+
+    await registrarLog({
+      req,
+      usuario,
+      acao: "PATCH",
+      tabela: "cadastro_obra",
+      registro_id: id,
+      antes,
+      depois,
+      observacao: "Atualizou parcialmente obra",
+    });
+
     return res.json({ ok: true });
   } catch (err) {
     console.error("PATCH /obras/:id exception:", err);
     return res.status(500).json({ ok: false, error: "Erro interno" });
   }
 });
+
 app.delete("/obras/:id", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
@@ -2331,10 +2908,11 @@ app.delete("/obras/:id", requireAuth, async (req, res) => {
     }
 
     const id = String(req.params.id || "").trim();
-
     if (!isUuid(id)) {
       return res.status(400).json({ ok: false, error: "id inválido (UUID)" });
     }
+
+    const antes = await getObraById(id);
 
     const { error } = await supabaseAdmin
       .from("cadastro_obra")
@@ -2349,6 +2927,17 @@ app.delete("/obras/:id", requireAuth, async (req, res) => {
       });
     }
 
+    await registrarLog({
+      req,
+      usuario,
+      acao: "DELETE",
+      tabela: "cadastro_obra",
+      registro_id: id,
+      antes,
+      depois: null,
+      observacao: "Excluiu obra",
+    });
+
     return res.json({ ok: true });
   } catch (err) {
     console.error("DELETE /obras/:id exception:", err);
@@ -2357,12 +2946,8 @@ app.delete("/obras/:id", requireAuth, async (req, res) => {
 });
 
 // ==================================================
-// QUINZENAS (CRUD) - public.cadastro_quinzena
-// admin: cadastrar, editar, excluir
-// financeiro: cadastrar, editar
+// QUINZENAS CRUD
 // ==================================================
-
-// LISTAR QUINZENAS
 app.get("/quinzenas", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
@@ -2388,6 +2973,15 @@ app.get("/quinzenas", requireAuth, async (req, res) => {
         .json({ ok: false, error: "Falha ao listar quinzenas" });
     }
 
+    await registrarLog({
+      req,
+      usuario,
+      acao: "LIST",
+      tabela: "cadastro_quinzena",
+      depois: { total: (data || []).length },
+      observacao: "Listou quinzenas",
+    });
+
     return res.json({ ok: true, data: data || [] });
   } catch (err) {
     console.error("GET /quinzenas exception:", err);
@@ -2395,7 +2989,6 @@ app.get("/quinzenas", requireAuth, async (req, res) => {
   }
 });
 
-// CRIAR QUINZENA
 app.post("/quinzenas", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
@@ -2431,7 +3024,6 @@ app.post("/quinzenas", requireAuth, async (req, res) => {
       });
     }
 
-    // evita duplicidade exata do período
     const { data: existente, error: errExist } = await supabaseAdmin
       .from("cadastro_quinzena")
       .select("id")
@@ -2473,6 +3065,18 @@ app.post("/quinzenas", requireAuth, async (req, res) => {
         .json({ ok: false, error: "Falha ao cadastrar quinzena" });
     }
 
+    const depois = await getQuinzenaById(data.id);
+
+    await registrarLog({
+      req,
+      usuario,
+      acao: "INSERT",
+      tabela: "cadastro_quinzena",
+      registro_id: data.id,
+      depois,
+      observacao: `Criou quinzena ${nome}`,
+    });
+
     return res.status(201).json({ ok: true, data });
   } catch (err) {
     console.error("POST /quinzenas exception:", err);
@@ -2480,7 +3084,6 @@ app.post("/quinzenas", requireAuth, async (req, res) => {
   }
 });
 
-// EDITAR QUINZENA
 app.put("/quinzenas/:id", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
@@ -2493,6 +3096,8 @@ app.put("/quinzenas/:id", requireAuth, async (req, res) => {
     }
 
     const id = String(req.params.id || "").trim();
+    const antes = await getQuinzenaById(id);
+
     const nome = String(req.body?.nome || "").trim();
     const data_inicio = String(req.body?.data_inicio || "").trim();
     const data_fim = String(req.body?.data_fim || "").trim();
@@ -2521,7 +3126,6 @@ app.put("/quinzenas/:id", requireAuth, async (req, res) => {
       });
     }
 
-    // evita duplicidade exata do período em outro registro
     const { data: existente, error: errExist } = await supabaseAdmin
       .from("cadastro_quinzena")
       .select("id")
@@ -2563,6 +3167,19 @@ app.put("/quinzenas/:id", requireAuth, async (req, res) => {
         .json({ ok: false, error: "Falha ao atualizar quinzena" });
     }
 
+    const depois = await getQuinzenaById(id);
+
+    await registrarLog({
+      req,
+      usuario,
+      acao: "UPDATE",
+      tabela: "cadastro_quinzena",
+      registro_id: id,
+      antes,
+      depois,
+      observacao: "Atualizou quinzena",
+    });
+
     return res.json({ ok: true });
   } catch (err) {
     console.error("PUT /quinzenas/:id exception:", err);
@@ -2570,7 +3187,6 @@ app.put("/quinzenas/:id", requireAuth, async (req, res) => {
   }
 });
 
-// EXCLUIR QUINZENA
 app.delete("/quinzenas/:id", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
@@ -2580,10 +3196,11 @@ app.delete("/quinzenas/:id", requireAuth, async (req, res) => {
     }
 
     const id = String(req.params.id || "").trim();
-
     if (!isUuid(id)) {
       return res.status(400).json({ ok: false, error: "id inválido (UUID)" });
     }
+
+    const antes = await getQuinzenaById(id);
 
     const { error } = await supabaseAdmin
       .from("cadastro_quinzena")
@@ -2597,17 +3214,26 @@ app.delete("/quinzenas/:id", requireAuth, async (req, res) => {
         .json({ ok: false, error: "Falha ao excluir quinzena" });
     }
 
+    await registrarLog({
+      req,
+      usuario,
+      acao: "DELETE",
+      tabela: "cadastro_quinzena",
+      registro_id: id,
+      antes,
+      depois: null,
+      observacao: "Excluiu quinzena",
+    });
+
     return res.json({ ok: true });
   } catch (err) {
     console.error("DELETE /quinzenas/:id exception:", err);
     return res.status(500).json({ ok: false, error: "Erro interno" });
   }
 });
+
 // ==================================================
-// RELATÓRIO POR OBRAS (DADOS CRUS)
-// - Agrupamento é feito no front
-// - admin/financeiro: todas as obras
-// - encarregado: somente suas obras
+// RELATÓRIO POR OBRAS
 // ==================================================
 app.get("/relatorios/obras", requireAuth, async (req, res) => {
   try {
@@ -2633,9 +3259,6 @@ app.get("/relatorios/obras", requireAuth, async (req, res) => {
       );
     }
 
-    // --------------------------------------------------
-    // 1) Obras permitidas conforme o nível
-    // --------------------------------------------------
     let qObras = supabaseAdmin
       .from("cadastro_obra")
       .select("id, nome, cidade, uf, situacao, responsavel")
@@ -2662,6 +3285,15 @@ app.get("/relatorios/obras", requireAuth, async (req, res) => {
     const obraIds = obrasList.map((o) => o.id);
 
     if (!obraIds.length) {
+      await registrarLog({
+        req,
+        usuario,
+        acao: "VIEW",
+        tabela: "relatorios_obras",
+        depois: { inicio, fim, total_obras: 0 },
+        observacao: "Consultou relatório por obras sem obras disponíveis",
+      });
+
       return res.json({
         ok: true,
         obras: [],
@@ -2672,9 +3304,6 @@ app.get("/relatorios/obras", requireAuth, async (req, res) => {
       });
     }
 
-    // --------------------------------------------------
-    // 2) Diárias das obras no período
-    // --------------------------------------------------
     const { data: diarias, error: errDiarias } = await supabaseAdmin
       .from("lanc_diarias")
       .select("obra_id, funcionario_id, data, qtd, valor_diaria_aplicado")
@@ -2690,9 +3319,6 @@ app.get("/relatorios/obras", requireAuth, async (req, res) => {
       });
     }
 
-    // --------------------------------------------------
-    // 3) Ajustes das obras no período
-    // --------------------------------------------------
     const { data: ajustes, error: errAjustes } = await supabaseAdmin
       .from("lanc_diarias_ajustes")
       .select("obra_id, funcionario_id, data_inicio, reembolso, adiantamento")
@@ -2708,9 +3334,6 @@ app.get("/relatorios/obras", requireAuth, async (req, res) => {
       });
     }
 
-    // --------------------------------------------------
-    // 4) Empreitas das obras no período
-    // --------------------------------------------------
     const { data: empreitas, error: errEmpreitas } = await supabaseAdmin
       .from("empreitas")
       .select("obra_id, funcionario_id, data_pagamento, valor")
@@ -2726,25 +3349,18 @@ app.get("/relatorios/obras", requireAuth, async (req, res) => {
       });
     }
 
-    // --------------------------------------------------
-    // 5) Descobrir funcionários envolvidos
-    // --------------------------------------------------
     const funcIdsSet = new Set();
-
-    (diarias || []).forEach((r) => {
-      if (r?.funcionario_id) funcIdsSet.add(r.funcionario_id);
-    });
-
-    (ajustes || []).forEach((r) => {
-      if (r?.funcionario_id) funcIdsSet.add(r.funcionario_id);
-    });
-
-    (empreitas || []).forEach((r) => {
-      if (r?.funcionario_id) funcIdsSet.add(r.funcionario_id);
-    });
+    (diarias || []).forEach(
+      (r) => r?.funcionario_id && funcIdsSet.add(r.funcionario_id),
+    );
+    (ajustes || []).forEach(
+      (r) => r?.funcionario_id && funcIdsSet.add(r.funcionario_id),
+    );
+    (empreitas || []).forEach(
+      (r) => r?.funcionario_id && funcIdsSet.add(r.funcionario_id),
+    );
 
     const funcIds = [...funcIdsSet];
-
     let funcionarios = [];
 
     if (funcIds.length > 0) {
@@ -2766,6 +3382,23 @@ app.get("/relatorios/obras", requireAuth, async (req, res) => {
 
       funcionarios = funcs || [];
     }
+
+    await registrarLog({
+      req,
+      usuario,
+      acao: "VIEW",
+      tabela: "relatorios_obras",
+      depois: {
+        inicio,
+        fim,
+        total_obras: obrasList.length,
+        total_funcionarios: funcionarios.length,
+        total_diarias: (diarias || []).length,
+        total_ajustes: (ajustes || []).length,
+        total_empreitas: (empreitas || []).length,
+      },
+      observacao: "Consultou relatório por obras",
+    });
 
     return res.json({
       ok: true,
