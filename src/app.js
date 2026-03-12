@@ -1013,10 +1013,12 @@ app.post("/funcionarios", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
 
-    if (!(isAdmin(usuario) || isFinanceiro(usuario))) {
+    if (
+      !(isAdmin(usuario) || isFinanceiro(usuario) || isEncarregado(usuario))
+    ) {
       return deny(
         res,
-        "Apenas administrador ou financeiro pode cadastrar funcionário",
+        "Apenas administrador, financeiro ou encarregado pode cadastrar funcionário",
       );
     }
 
