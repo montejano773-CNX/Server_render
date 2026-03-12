@@ -130,6 +130,18 @@ function getClientIp(req) {
   return req.ip || null;
 }
 
+function normalizarTexto(v) {
+  return String(v || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .trim()
+    .toUpperCase();
+}
+
+function isObraEquipeEngenharia(obra) {
+  return normalizarTexto(obra?.nome) === "EQUIPE ENGENHARIA";
+}
+
 async function registrarLog({
   req,
   usuario = null,
@@ -215,16 +227,49 @@ function isConsulta(usuario) {
   return getNivel(usuario) === "consulta";
 }
 
-async function encarregadoPodeAcessarObra(authUserId, obraId) {
+// --------------------------------------------------
+// NOVA REGRA DE ACESSO À OBRA
+// - admin: acessa tudo
+// - encarregado: acessa todas as obras
+// - exceção: "EQUIPE ENGENHARIA" só admin
+// --------------------------------------------------
+async function usuarioPodeAcessarObra(usuario, obraId) {
+  if (!isUuid(obraId)) return false;
+
+  const obra = await getObraById(obraId);
+  if (!obra) return false;
+
+  if (isAdmin(usuario)) return true;
+
+  if (isObraEquipeEngenharia(obra)) return false;
+
+  if (isEncarregado(usuario)) return true;
+
+  if (isFinanceiro(usuario)) return true;
+
+  return false;
+}
+
+async function filtrarObrasVisiveis(usuario, obras) {
+  const lista = Array.isArray(obras) ? obras : [];
+
+  if (isAdmin(usuario)) return lista;
+
+  return lista.filter((obra) => !isObraEquipeEngenharia(obra));
+}
+
+async function getIdsObrasVisiveisUsuario(usuario) {
   const { data, error } = await supabaseAdmin
     .from("cadastro_obra")
-    .select("id")
-    .eq("id", obraId)
-    .eq("responsavel", authUserId)
-    .maybeSingle();
+    .select("id, nome");
 
-  if (error) return false;
-  return !!data;
+  if (error) {
+    console.error("getIdsObrasVisiveisUsuario error:", error);
+    return [];
+  }
+
+  const visiveis = await filtrarObrasVisiveis(usuario, data || []);
+  return visiveis.map((o) => o.id);
 }
 
 async function getEquipeObraById(id) {
@@ -829,48 +874,42 @@ app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
       });
     }
 
-    const { data: funcionarios, error: errFunc } = await supabaseAdmin
-      .from("cadastro_func")
-      .select(
-        "id, nome, funcao, razao_social, titular_conta, cpf, banco, agencia, conta, chave_pix_tipo, chave_pix, situacao",
-      )
-      .order("nome", { ascending: true });
+    let obraIdsPermitidas = null;
 
-    if (errFunc) {
-      console.error("GET /relatorios/pagamento funcionarios error:", errFunc);
-      return res
-        .status(500)
-        .json({ ok: false, error: "Falha ao listar funcionários" });
+    if (!isAdmin(usuario)) {
+      obraIdsPermitidas = await getIdsObrasVisiveisUsuario(usuario);
+
+      if (!obraIdsPermitidas.length) {
+        await registrarLog({
+          req,
+          usuario,
+          acao: "VIEW",
+          tabela: "relatorios_pagamento",
+          depois: { inicio, fim, total_funcionarios: 0, total_obras: 0 },
+          observacao: "Consultou relatório de pagamento sem obras visíveis",
+        });
+
+        return res.json({
+          ok: true,
+          funcionarios: [],
+          diarias: [],
+          ajustes: [],
+          empreitas: [],
+        });
+      }
     }
 
-    const funcList = funcionarios || [];
-    const funcIds = funcList.map((f) => f.id);
-
-    if (funcIds.length === 0) {
-      await registrarLog({
-        req,
-        usuario,
-        acao: "VIEW",
-        tabela: "relatorios_pagamento",
-        depois: { inicio, fim, total_funcionarios: 0 },
-        observacao: "Consultou relatório de pagamento sem funcionários",
-      });
-
-      return res.json({
-        ok: true,
-        funcionarios: [],
-        diarias: [],
-        ajustes: [],
-        empreitas: [],
-      });
-    }
-
-    const { data: diarias, error: errDiarias } = await supabaseAdmin
+    let qDiarias = supabaseAdmin
       .from("lanc_diarias")
-      .select("funcionario_id, data, qtd, valor_diaria_aplicado")
-      .in("funcionario_id", funcIds)
+      .select("obra_id, funcionario_id, data, qtd, valor_diaria_aplicado")
       .gte("data", inicio)
       .lte("data", fim);
+
+    if (obraIdsPermitidas) {
+      qDiarias = qDiarias.in("obra_id", obraIdsPermitidas);
+    }
+
+    const { data: diarias, error: errDiarias } = await qDiarias;
 
     if (errDiarias) {
       console.error("GET /relatorios/pagamento diarias error:", errDiarias);
@@ -879,12 +918,19 @@ app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
         .json({ ok: false, error: "Falha ao buscar diárias" });
     }
 
-    const { data: ajustes, error: errAj } = await supabaseAdmin
+    let qAjustes = supabaseAdmin
       .from("lanc_diarias_ajustes")
-      .select("funcionario_id, data_inicio, reembolso, adiantamento")
-      .in("funcionario_id", funcIds)
+      .select(
+        "obra_id, funcionario_id, data_inicio, reembolso, adiantamento, observacao, valor",
+      )
       .gte("data_inicio", inicio)
       .lte("data_inicio", fim);
+
+    if (obraIdsPermitidas) {
+      qAjustes = qAjustes.in("obra_id", obraIdsPermitidas);
+    }
+
+    const { data: ajustes, error: errAj } = await qAjustes;
 
     if (errAj) {
       console.error("GET /relatorios/pagamento ajustes error:", errAj);
@@ -894,18 +940,59 @@ app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
       });
     }
 
-    const { data: empreitas, error: errEmp } = await supabaseAdmin
+    let qEmpreitas = supabaseAdmin
       .from("empreitas")
-      .select("funcionario_id, data_pagamento, valor")
-      .in("funcionario_id", funcIds)
+      .select("obra_id, funcionario_id, data_pagamento, valor")
       .gte("data_pagamento", inicio)
       .lte("data_pagamento", fim);
+
+    if (obraIdsPermitidas) {
+      qEmpreitas = qEmpreitas.in("obra_id", obraIdsPermitidas);
+    }
+
+    const { data: empreitas, error: errEmp } = await qEmpreitas;
 
     if (errEmp) {
       console.error("GET /relatorios/pagamento empreitas error:", errEmp);
       return res
         .status(500)
         .json({ ok: false, error: "Falha ao buscar empreitas" });
+    }
+
+    const funcIdsSet = new Set();
+
+    (diarias || []).forEach((r) => {
+      if (r?.funcionario_id) funcIdsSet.add(r.funcionario_id);
+    });
+
+    (ajustes || []).forEach((r) => {
+      if (r?.funcionario_id) funcIdsSet.add(r.funcionario_id);
+    });
+
+    (empreitas || []).forEach((r) => {
+      if (r?.funcionario_id) funcIdsSet.add(r.funcionario_id);
+    });
+
+    const funcIds = [...funcIdsSet];
+    let funcionarios = [];
+
+    if (funcIds.length > 0) {
+      const { data: funcs, error: errFunc } = await supabaseAdmin
+        .from("cadastro_func")
+        .select(
+          "id, nome, funcao, razao_social, titular_conta, cpf, banco, agencia, conta, chave_pix_tipo, chave_pix, situacao",
+        )
+        .in("id", funcIds)
+        .order("nome", { ascending: true });
+
+      if (errFunc) {
+        console.error("GET /relatorios/pagamento funcionarios error:", errFunc);
+        return res
+          .status(500)
+          .json({ ok: false, error: "Falha ao listar funcionários" });
+      }
+
+      funcionarios = funcs || [];
     }
 
     await registrarLog({
@@ -916,17 +1003,19 @@ app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
       depois: {
         inicio,
         fim,
-        total_funcionarios: funcList.length,
+        total_funcionarios: funcionarios.length,
         total_diarias: (diarias || []).length,
         total_ajustes: (ajustes || []).length,
         total_empreitas: (empreitas || []).length,
+        total_obras: obraIdsPermitidas ? obraIdsPermitidas.length : null,
       },
-      observacao: "Consultou relatório de pagamento",
+      observacao:
+        "Consultou relatório de pagamento filtrado por funcionários com movimento",
     });
 
     return res.json({
       ok: true,
-      funcionarios: funcList,
+      funcionarios,
       diarias: diarias || [],
       ajustes: ajustes || [],
       empreitas: empreitas || [],
@@ -1034,7 +1123,7 @@ app.post("/funcionarios", requireAuth, async (req, res) => {
       funcao: req.body?.funcao?.trim?.() || null,
       valor_diaria: vdi ?? 0,
       cpf: req.body?.cpf ? String(req.body.cpf).replace(/\D/g, "") : null,
-      rg: req.body?.rg ? String(req.body.rg).trim() : null,
+      rg: req.body?.rg ? String(req.body.rg).replace(/\D/g, "") : null,
       situacao: normSituacao(req.body?.situacao, "ativo"),
       razao_social: req.body?.razao_social?.trim?.() || null,
       titular_conta: req.body?.titular_conta?.trim?.() || null,
@@ -1086,8 +1175,13 @@ app.put("/funcionarios/:id", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
 
-    if (!isAdmin(usuario)) {
-      return deny(res, "Apenas administrador pode editar funcionário");
+    if (
+      !(isAdmin(usuario) || isFinanceiro(usuario) || isEncarregado(usuario))
+    ) {
+      return deny(
+        res,
+        "Apenas administrador, financeiro ou encarregado pode cadastrar funcionário",
+      );
     }
 
     const id = req.params.id;
@@ -1111,7 +1205,7 @@ app.put("/funcionarios/:id", requireAuth, async (req, res) => {
       nome,
       funcao: req.body?.funcao ? String(req.body.funcao).trim() : null,
       valor_diaria: vdi,
-      rg: req.body?.rg ? String(req.body.rg).trim() : null,
+      rg: req.body?.rg ? String(req.body.rg).replace(/\D/g, "") : null,
       cpf: req.body?.cpf ? String(req.body.cpf).replace(/\D/g, "") : null,
       situacao: normSituacao(req.body?.situacao, "ativo"),
       razao_social: req.body?.razao_social
@@ -1166,8 +1260,13 @@ app.patch("/funcionarios/:id", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
 
-    if (!isAdmin(usuario)) {
-      return deny(res, "Apenas administrador pode editar funcionário");
+    if (
+      !(isAdmin(usuario) || isFinanceiro(usuario) || isEncarregado(usuario))
+    ) {
+      return deny(
+        res,
+        "Apenas administrador, financeiro ou encarregado pode cadastrar funcionário",
+      );
     }
 
     const id = req.params.id;
@@ -1184,7 +1283,7 @@ app.patch("/funcionarios/:id", requireAuth, async (req, res) => {
         ? { cpf: req.body.cpf ? String(req.body.cpf).replace(/\D/g, "") : null }
         : {}),
       ...(req.body?.rg !== undefined
-        ? { rg: req.body.rg ? String(req.body.rg).trim() : null }
+        ? { rg: req.body.rg ? String(req.body.rg).replace(/\D/g, "") : null }
         : {}),
       ...(req.body?.situacao !== undefined
         ? { situacao: normSituacao(req.body.situacao) }
@@ -1272,8 +1371,13 @@ app.delete("/funcionarios/:id", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
 
-    if (!isAdmin(usuario)) {
-      return deny(res, "Apenas administrador pode excluir funcionário");
+    if (
+      !(isAdmin(usuario) || isFinanceiro(usuario) || isEncarregado(usuario))
+    ) {
+      return deny(
+        res,
+        "Apenas administrador, financeiro ou encarregado pode cadastrar funcionário",
+      );
     }
 
     const id = req.params.id;
@@ -1315,7 +1419,6 @@ app.delete("/funcionarios/:id", requireAuth, async (req, res) => {
 app.get("/equipe-obra", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
-    const authId = req.authUser.id;
     const obraId = String(req.query?.obra_id || "").trim();
 
     if (!isUuid(obraId)) {
@@ -1329,14 +1432,16 @@ app.get("/equipe-obra", requireAuth, async (req, res) => {
       return deny(res, "Usuário somente consulta não acessa equipe por obra");
     }
 
-    if (isEncarregado(usuario)) {
-      const pode = await encarregadoPodeAcessarObra(authId, obraId);
-      if (!pode) {
-        return deny(
-          res,
-          "Você só pode acessar a equipe das suas próprias obras",
-        );
-      }
+    if (!(isAdmin(usuario) || isEncarregado(usuario))) {
+      return deny(
+        res,
+        "Apenas administrador ou encarregado acessa equipe por obra",
+      );
+    }
+
+    const pode = await usuarioPodeAcessarObra(usuario, obraId);
+    if (!pode) {
+      return deny(res, "Você não pode acessar esta obra");
     }
 
     const { data, error } = await supabaseAdmin
@@ -1373,7 +1478,6 @@ app.get("/equipe-obra", requireAuth, async (req, res) => {
 app.post("/equipe-obra", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
-    const authId = req.authUser.id;
 
     if (isConsulta(usuario)) {
       return deny(
@@ -1382,10 +1486,11 @@ app.post("/equipe-obra", requireAuth, async (req, res) => {
       );
     }
 
-    if (
-      !(isAdmin(usuario) || isFinanceiro(usuario) || isEncarregado(usuario))
-    ) {
-      return deny(res);
+    if (!(isAdmin(usuario) || isEncarregado(usuario))) {
+      return deny(
+        res,
+        "Apenas administrador ou encarregado pode alterar equipe por obra",
+      );
     }
 
     const obra_id = String(req.body?.obra_id || "").trim();
@@ -1402,11 +1507,9 @@ app.post("/equipe-obra", requireAuth, async (req, res) => {
         .json({ ok: false, error: "funcionario_id inválido (UUID)" });
     }
 
-    if (isEncarregado(usuario)) {
-      const pode = await encarregadoPodeAcessarObra(authId, obra_id);
-      if (!pode) {
-        return deny(res, "Você só pode alterar equipe das suas próprias obras");
-      }
+    const pode = await usuarioPodeAcessarObra(usuario, obra_id);
+    if (!pode) {
+      return deny(res, "Você não pode alterar esta obra");
     }
 
     const situacao = normSituacao(req.body?.situacao, "ativo");
@@ -1496,7 +1599,6 @@ app.post("/equipe-obra", requireAuth, async (req, res) => {
 app.delete("/equipe-obra/:id", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
-    const authId = req.authUser.id;
     const id = String(req.params.id || "").trim();
 
     if (!isUuid(id)) {
@@ -1510,10 +1612,11 @@ app.delete("/equipe-obra/:id", requireAuth, async (req, res) => {
       );
     }
 
-    if (
-      !(isAdmin(usuario) || isFinanceiro(usuario) || isEncarregado(usuario))
-    ) {
-      return deny(res);
+    if (!(isAdmin(usuario) || isEncarregado(usuario))) {
+      return deny(
+        res,
+        "Apenas administrador ou encarregado pode remover equipe por obra",
+      );
     }
 
     const vinculo = await getEquipeObraById(id);
@@ -1523,11 +1626,9 @@ app.delete("/equipe-obra/:id", requireAuth, async (req, res) => {
         .json({ ok: false, error: "Vínculo não encontrado" });
     }
 
-    if (isEncarregado(usuario)) {
-      const pode = await encarregadoPodeAcessarObra(authId, vinculo.obra_id);
-      if (!pode) {
-        return deny(res, "Você só pode remover equipe das suas próprias obras");
-      }
+    const pode = await usuarioPodeAcessarObra(usuario, vinculo.obra_id);
+    if (!pode) {
+      return deny(res, "Você não pode alterar esta obra");
     }
 
     const { error } = await supabaseAdmin
@@ -1568,7 +1669,6 @@ app.delete("/equipe-obra/:id", requireAuth, async (req, res) => {
 app.get("/lanc-diarias", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
-    const authId = req.authUser.id;
 
     const obra_id = String(req.query?.obra_id || "").trim();
     const data_inicio = String(req.query?.data_inicio || "").trim();
@@ -1588,14 +1688,9 @@ app.get("/lanc-diarias", requireAuth, async (req, res) => {
       );
     }
 
-    if (isEncarregado(usuario)) {
-      const pode = await encarregadoPodeAcessarObra(authId, obra_id);
-      if (!pode) {
-        return deny(
-          res,
-          "Você só pode acessar diárias das suas próprias obras",
-        );
-      }
+    const pode = await usuarioPodeAcessarObra(usuario, obra_id);
+    if (!pode) {
+      return deny(res, "Você não pode acessar esta obra");
     }
 
     const { data, error } = await supabaseAdmin
@@ -1631,7 +1726,6 @@ app.get("/lanc-diarias", requireAuth, async (req, res) => {
 app.post("/lanc-diarias", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
-    const authId = req.authUser.id;
 
     if (!(isAdmin(usuario) || isEncarregado(usuario))) {
       return deny(
@@ -1668,16 +1762,11 @@ app.post("/lanc-diarias", requireAuth, async (req, res) => {
       return { obra_id, funcionario_id, data, qtd, valor_diaria_aplicado: vda };
     });
 
-    if (isEncarregado(usuario)) {
-      const obraIds = [...new Set(normalized.map((r) => r.obra_id))];
-      for (const obraId of obraIds) {
-        const pode = await encarregadoPodeAcessarObra(authId, obraId);
-        if (!pode) {
-          return deny(
-            res,
-            "Você só pode lançar diárias nas suas próprias obras",
-          );
-        }
+    const obraIds = [...new Set(normalized.map((r) => r.obra_id))];
+    for (const obraId of obraIds) {
+      const pode = await usuarioPodeAcessarObra(usuario, obraId);
+      if (!pode) {
+        return deny(res, "Você não pode lançar diárias nesta obra");
       }
     }
 
@@ -1719,7 +1808,6 @@ app.post("/lanc-diarias", requireAuth, async (req, res) => {
 app.get("/diarias-ajustes", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
-    const authId = req.authUser.id;
     const obra_id = String(req.query?.obra_id || "").trim();
     const data_inicio = String(req.query?.data_inicio || "").trim();
 
@@ -1737,14 +1825,9 @@ app.get("/diarias-ajustes", requireAuth, async (req, res) => {
       );
     }
 
-    if (isEncarregado(usuario)) {
-      const pode = await encarregadoPodeAcessarObra(authId, obra_id);
-      if (!pode) {
-        return deny(
-          res,
-          "Você só pode acessar ajustes das suas próprias obras",
-        );
-      }
+    const pode = await usuarioPodeAcessarObra(usuario, obra_id);
+    if (!pode) {
+      return deny(res, "Você não pode acessar esta obra");
     }
 
     const { data, error } = await supabaseAdmin
@@ -1781,7 +1864,6 @@ app.get("/diarias-ajustes", requireAuth, async (req, res) => {
 app.post("/diarias-ajustes", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
-    const authId = req.authUser.id;
 
     if (!(isAdmin(usuario) || isEncarregado(usuario))) {
       return deny(
@@ -1846,16 +1928,11 @@ app.post("/diarias-ajustes", requireAuth, async (req, res) => {
       };
     });
 
-    if (isEncarregado(usuario)) {
-      const obraIds = [...new Set(normalized.map((a) => a.obra_id))];
-      for (const obraId of obraIds) {
-        const pode = await encarregadoPodeAcessarObra(authId, obraId);
-        if (!pode) {
-          return deny(
-            res,
-            "Você só pode salvar ajustes nas suas próprias obras",
-          );
-        }
+    const obraIds = [...new Set(normalized.map((a) => a.obra_id))];
+    for (const obraId of obraIds) {
+      const pode = await usuarioPodeAcessarObra(usuario, obraId);
+      if (!pode) {
+        return deny(res, "Você não pode salvar ajustes nesta obra");
       }
     }
 
@@ -1894,41 +1971,21 @@ app.post("/diarias-ajustes", requireAuth, async (req, res) => {
 app.get("/funcionarios-vinculados", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
-    const authId = req.authUser.id;
 
     if (isConsulta(usuario)) {
       return deny(res, "Usuário somente consulta não acessa vínculos por obra");
     }
 
-    let query = supabaseAdmin
-      .from("equipe_obra")
-      .select("obra_id, funcionario_id, situacao");
-
-    if (isEncarregado(usuario)) {
-      const { data: obrasDoEncarregado, error: obrasErr } = await supabaseAdmin
-        .from("cadastro_obra")
-        .select("id")
-        .eq("responsavel", authId);
-
-      if (obrasErr) {
-        console.error(
-          "GET /funcionarios-vinculados obras encarregado error:",
-          obrasErr,
-        );
-        return res
-          .status(500)
-          .json({ ok: false, error: "Erro ao buscar obras do encarregado" });
-      }
-
-      const obraIds = (obrasDoEncarregado || []).map((o) => o.id);
-      if (!obraIds.length) {
-        return res.json({ ok: true, data: [] });
-      }
-
-      query = query.in("obra_id", obraIds);
+    if (!(isAdmin(usuario) || isEncarregado(usuario))) {
+      return deny(
+        res,
+        "Apenas administrador ou encarregado pode acessar vínculos por obra",
+      );
     }
 
-    const { data, error } = await query;
+    const { data, error } = await supabaseAdmin
+      .from("equipe_obra")
+      .select("obra_id, funcionario_id, situacao");
 
     if (error) {
       console.error("GET /funcionarios-vinculados error:", error);
@@ -1940,15 +1997,27 @@ app.get("/funcionarios-vinculados", requireAuth, async (req, res) => {
     const withNames = await enrichEquipeRowsWithNames(data || []);
     const withObras = await enrichEquipeRowsWithObraNames(withNames);
 
-    const out = (withObras || []).map((r) => ({
-      id: r.funcionario_id,
-      nome: r.funcionario_nome,
-      funcao: r.funcionario_funcao,
-      valor_diaria: Number(r.funcionario_valor_diaria || r.valor_diaria || 0),
-      obra_id: r.obra_id,
-      obra_nome: r.obra_nome,
-      situacao: r.situacao,
-    }));
+    const filtrados = await filtrarObrasVisiveis(
+      usuario,
+      (withObras || []).map((r) => ({
+        id: r.obra_id,
+        nome: r.obra_nome,
+      })),
+    );
+
+    const idsPermitidos = new Set((filtrados || []).map((o) => o.id));
+
+    const out = (withObras || [])
+      .filter((r) => idsPermitidos.has(r.obra_id))
+      .map((r) => ({
+        id: r.funcionario_id,
+        nome: r.funcionario_nome,
+        funcao: r.funcionario_funcao,
+        valor_diaria: Number(r.funcionario_valor_diaria || r.valor_diaria || 0),
+        obra_id: r.obra_id,
+        obra_nome: r.obra_nome,
+        situacao: r.situacao,
+      }));
 
     await registrarLog({
       req,
@@ -2024,7 +2093,6 @@ app.get("/equipe-obra/todas", requireAuth, async (req, res) => {
 app.get("/empreitas", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
-    const authId = req.authUser.id;
     const { inicio, fim, obra_id, funcionario_id } = req.query;
 
     if (!(isAdmin(usuario) || isEncarregado(usuario))) {
@@ -2049,17 +2117,20 @@ app.get("/empreitas", requireAuth, async (req, res) => {
           .json({ ok: false, error: "obra_id inválido (UUID)" });
       }
 
-      if (isEncarregado(usuario)) {
-        const pode = await encarregadoPodeAcessarObra(authId, obra_id);
-        if (!pode) {
-          return deny(
-            res,
-            "Você só pode acessar empreitas das suas próprias obras",
-          );
-        }
+      const pode = await usuarioPodeAcessarObra(usuario, obra_id);
+      if (!pode) {
+        return deny(res, "Você não pode acessar esta obra");
       }
 
       q = q.eq("obra_id", obra_id);
+    } else if (!isAdmin(usuario)) {
+      const permitidas = await getIdsObrasVisiveisUsuario(usuario);
+
+      if (!permitidas.length) {
+        return res.json({ ok: true, data: [] });
+      }
+
+      q = q.in("obra_id", permitidas);
     }
 
     if (funcionario_id) {
@@ -2069,27 +2140,6 @@ app.get("/empreitas", requireAuth, async (req, res) => {
           .json({ ok: false, error: "funcionario_id inválido (UUID)" });
       }
       q = q.eq("funcionario_id", funcionario_id);
-    }
-
-    if (isEncarregado(usuario) && !obra_id) {
-      const { data: obrasDoEncarregado, error: obrasErr } = await supabaseAdmin
-        .from("cadastro_obra")
-        .select("id")
-        .eq("responsavel", authId);
-
-      if (obrasErr) {
-        console.error("GET /empreitas obras encarregado error:", obrasErr);
-        return res
-          .status(500)
-          .json({ ok: false, error: "Erro ao buscar obras do encarregado" });
-      }
-
-      const obraIds = (obrasDoEncarregado || []).map((o) => o.id);
-      if (!obraIds.length) {
-        return res.json({ ok: true, data: [] });
-      }
-
-      q = q.in("obra_id", obraIds);
     }
 
     if (inicio) q = q.gte("data_pagamento", String(inicio));
@@ -2129,7 +2179,6 @@ app.get("/empreitas", requireAuth, async (req, res) => {
 app.get("/empreitas/:id", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
-    const authId = req.authUser.id;
     const id = req.params.id;
 
     if (!(isAdmin(usuario) || isEncarregado(usuario))) {
@@ -2152,14 +2201,9 @@ app.get("/empreitas/:id", requireAuth, async (req, res) => {
         .json({ ok: false, error: "Empreita não encontrada" });
     }
 
-    if (isEncarregado(usuario)) {
-      const pode = await encarregadoPodeAcessarObra(authId, data.obra_id);
-      if (!pode) {
-        return deny(
-          res,
-          "Você só pode acessar empreitas das suas próprias obras",
-        );
-      }
+    const pode = await usuarioPodeAcessarObra(usuario, data.obra_id);
+    if (!pode) {
+      return deny(res, "Você não pode acessar esta obra");
     }
 
     await registrarLog({
@@ -2182,7 +2226,6 @@ app.get("/empreitas/:id", requireAuth, async (req, res) => {
 app.post("/empreitas", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
-    const authId = req.authUser.id;
 
     if (!(isAdmin(usuario) || isEncarregado(usuario))) {
       return deny(
@@ -2205,14 +2248,9 @@ app.post("/empreitas", requireAuth, async (req, res) => {
         .json({ ok: false, error: "obra_id é obrigatório (UUID)" });
     }
 
-    if (isEncarregado(usuario)) {
-      const pode = await encarregadoPodeAcessarObra(authId, obra_id);
-      if (!pode) {
-        return deny(
-          res,
-          "Você só pode lançar empreita nas suas próprias obras",
-        );
-      }
+    const pode = await usuarioPodeAcessarObra(usuario, obra_id);
+    if (!pode) {
+      return deny(res, "Você não pode lançar empreita nesta obra");
     }
 
     if (!isUuid(funcionario_id)) {
@@ -2277,7 +2315,6 @@ app.post("/empreitas", requireAuth, async (req, res) => {
 app.put("/empreitas/:id", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
-    const authId = req.authUser.id;
     const id = String(req.params.id || "").trim();
 
     if (!isUuid(id)) {
@@ -2298,14 +2335,9 @@ app.put("/empreitas/:id", requireAuth, async (req, res) => {
         .json({ ok: false, error: "Empreita não encontrada" });
     }
 
-    if (isEncarregado(usuario)) {
-      const pode = await encarregadoPodeAcessarObra(authId, antes.obra_id);
-      if (!pode) {
-        return deny(
-          res,
-          "Você só pode editar empreitas das suas próprias obras",
-        );
-      }
+    const podeAntes = await usuarioPodeAcessarObra(usuario, antes.obra_id);
+    if (!podeAntes) {
+      return deny(res, "Você não pode editar esta empreita");
     }
 
     const obra_id = String(req.body?.obra_id || "").trim();
@@ -2342,14 +2374,9 @@ app.put("/empreitas/:id", requireAuth, async (req, res) => {
       });
     }
 
-    if (isEncarregado(usuario)) {
-      const podeNovaObra = await encarregadoPodeAcessarObra(authId, obra_id);
-      if (!podeNovaObra) {
-        return deny(
-          res,
-          "Você só pode editar empreitas nas suas próprias obras",
-        );
-      }
+    const podeNovaObra = await usuarioPodeAcessarObra(usuario, obra_id);
+    if (!podeNovaObra) {
+      return deny(res, "Você não pode mover/editar empreita nesta obra");
     }
 
     const payload = {
@@ -2395,7 +2422,6 @@ app.put("/empreitas/:id", requireAuth, async (req, res) => {
 app.delete("/empreitas/:id", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
-    const authId = req.authUser.id;
     const id = String(req.params.id || "").trim();
 
     if (!isUuid(id)) {
@@ -2416,14 +2442,9 @@ app.delete("/empreitas/:id", requireAuth, async (req, res) => {
         .json({ ok: false, error: "Empreita não encontrada" });
     }
 
-    if (isEncarregado(usuario)) {
-      const pode = await encarregadoPodeAcessarObra(authId, antes.obra_id);
-      if (!pode) {
-        return deny(
-          res,
-          "Você só pode excluir empreitas das suas próprias obras",
-        );
-      }
+    const pode = await usuarioPodeAcessarObra(usuario, antes.obra_id);
+    if (!pode) {
+      return deny(res, "Você não pode excluir esta empreita");
     }
 
     const { error } = await supabaseAdmin
@@ -2462,22 +2483,22 @@ app.delete("/empreitas/:id", requireAuth, async (req, res) => {
 app.get("/obras", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
-    const authId = req.authUser.id;
 
     if (isConsulta(usuario)) {
       return deny(res, "Usuário somente consulta não acessa obras");
     }
 
-    let query = supabaseAdmin
+    if (!(isAdmin(usuario) || isEncarregado(usuario))) {
+      return deny(
+        res,
+        "Apenas administrador ou encarregado pode acessar obras",
+      );
+    }
+
+    const { data, error } = await supabaseAdmin
       .from("cadastro_obra")
       .select("id, nome, cidade, uf, situacao, responsavel")
       .order("nome", { ascending: true });
-
-    if (isEncarregado(usuario)) {
-      query = query.eq("responsavel", authId);
-    }
-
-    const { data, error } = await query;
 
     if (error) {
       console.error("GET /obras error:", error);
@@ -2486,16 +2507,18 @@ app.get("/obras", requireAuth, async (req, res) => {
         .json({ ok: false, error: "Falha ao listar obras" });
     }
 
+    const obrasVisiveis = await filtrarObrasVisiveis(usuario, data || []);
+
     await registrarLog({
       req,
       usuario,
       acao: "LIST",
       tabela: "cadastro_obra",
-      depois: { total: (data || []).length },
-      observacao: "Listou obras",
+      depois: { total: (obrasVisiveis || []).length },
+      observacao: "Listou obras visíveis ao usuário",
     });
 
-    return res.json({ ok: true, data: data || [] });
+    return res.json({ ok: true, data: obrasVisiveis || [] });
   } catch (err) {
     console.error("GET /obras exception:", err);
     return res.status(500).json({ ok: false, error: "Erro interno" });
@@ -2541,11 +2564,9 @@ app.get("/obras/todas", requireAuth, async (req, res) => {
   }
 });
 
-// GET /obras/:id
 app.get("/obras/:id", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
-    const authId = req.authUser.id;
     const id = String(req.params.id || "").trim();
 
     if (!isUuid(id)) {
@@ -2556,16 +2577,18 @@ app.get("/obras/:id", requireAuth, async (req, res) => {
       return deny(res, "Usuário somente consulta não acessa obra");
     }
 
+    if (!(isAdmin(usuario) || isEncarregado(usuario))) {
+      return deny(res, "Apenas administrador ou encarregado pode acessar obra");
+    }
+
     const data = await getObraById(id);
     if (!data) {
       return res.status(404).json({ ok: false, error: "Obra não encontrada" });
     }
 
-    if (isEncarregado(usuario)) {
-      const pode = await encarregadoPodeAcessarObra(authId, id);
-      if (!pode) {
-        return deny(res, "Você só pode acessar suas próprias obras");
-      }
+    const pode = await usuarioPodeAcessarObra(usuario, id);
+    if (!pode) {
+      return deny(res, "Você não tem permissão para acessar esta obra");
     }
 
     await registrarLog({
@@ -3240,7 +3263,6 @@ app.delete("/quinzenas/:id", requireAuth, async (req, res) => {
 app.get("/relatorios/obras", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
-    const authId = req.authUser.id;
 
     const inicio = String(req.query?.inicio || "").trim();
     const fim = String(req.query?.fim || "").trim();
@@ -3261,16 +3283,10 @@ app.get("/relatorios/obras", requireAuth, async (req, res) => {
       );
     }
 
-    let qObras = supabaseAdmin
+    const { data: obras, error: errObras } = await supabaseAdmin
       .from("cadastro_obra")
       .select("id, nome, cidade, uf, situacao, responsavel")
       .order("nome", { ascending: true });
-
-    if (isEncarregado(usuario)) {
-      qObras = qObras.eq("responsavel", authId);
-    }
-
-    const { data: obras, error: errObras } = await qObras;
 
     if (errObras) {
       console.error("GET /relatorios/obras obras error:", errObras);
@@ -3280,7 +3296,9 @@ app.get("/relatorios/obras", requireAuth, async (req, res) => {
       });
     }
 
-    const obrasList = (obras || []).filter(
+    const obrasVisiveis = await filtrarObrasVisiveis(usuario, obras || []);
+
+    const obrasList = (obrasVisiveis || []).filter(
       (o) => String(o.situacao || "ativo").toLowerCase() === "ativo",
     );
 
