@@ -36,6 +36,31 @@ app.use(express.json());
 // ==================================================
 // HELPERS
 // ==================================================
+// --------------------------------------------------
+// REGRA DE VISIBILIDADE DE FUNCIONÁRIOS
+// - admin vê tudo
+// - outros usuários NÃO veem função "EQUIPE ENGENHARIA"
+// --------------------------------------------------
+
+function isEquipeEngenharia(funcao) {
+  return (
+    String(funcao || "")
+      .trim()
+      .toUpperCase() === "EQUIPE ENGENHARIA"
+  );
+}
+
+function podeVerFuncionario(usuario, funcionario) {
+  if (isAdmin(usuario)) return true;
+
+  return !isEquipeEngenharia(funcionario?.funcao);
+}
+
+function podeVerFuncionario(usuario, funcionario) {
+  if (isAdmin(usuario)) return true;
+  return !isEquipeEngenharia(funcionario?.funcao);
+}
+
 function isUuid(v) {
   if (!v) return false;
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
@@ -135,11 +160,13 @@ function normalizarTexto(v) {
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
     .trim()
+    .replace(/\s+/g, " ")
     .toUpperCase();
 }
 
 function isObraEquipeEngenharia(obra) {
-  return normalizarTexto(obra?.nome) === "EQUIPE ENGENHARIA";
+  const nome = normalizarTexto(obra?.nome);
+  return nome === "EQUIPE ENGENHARIA";
 }
 
 async function registrarLog({
@@ -244,7 +271,6 @@ async function usuarioPodeAcessarObra(usuario, obraId) {
   if (isObraEquipeEngenharia(obra)) return false;
 
   if (isEncarregado(usuario)) return true;
-
   if (isFinanceiro(usuario)) return true;
 
   return false;
@@ -1047,16 +1073,21 @@ app.get("/funcionarios", requireAuth, async (req, res) => {
         .json({ ok: false, error: "Falha ao listar funcionários" });
     }
 
+    // aplica regra
+    const filtrados = (data || []).filter((f) =>
+      podeVerFuncionario(usuario, f),
+    );
+
     await registrarLog({
       req,
       usuario,
       acao: "LIST",
       tabela: "cadastro_func",
-      depois: { total: (data || []).length },
-      observacao: "Listou funcionários",
+      depois: { total: filtrados.length },
+      observacao: "Listou funcionários com regra de visibilidade",
     });
 
-    return res.json({ ok: true, data: data || [] });
+    return res.json({ ok: true, data: filtrados });
   } catch (err) {
     console.error("GET /funcionarios exception:", err);
     return res.status(500).json({ ok: false, error: "Erro interno" });
@@ -1067,6 +1098,10 @@ app.get("/funcionarios/:id", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
     const id = req.params.id;
+
+    if (!isUuid(id)) {
+      return res.status(400).json({ ok: false, error: "ID inválido" });
+    }
 
     const { data, error } = await supabaseAdmin
       .from("cadastro_func")
@@ -1081,14 +1116,20 @@ app.get("/funcionarios/:id", requireAuth, async (req, res) => {
         .json({ ok: false, error: "Funcionário não encontrado" });
     }
 
+    // aplica regra de acesso
+    if (!podeVerFuncionario(usuario, data)) {
+      return res
+        .status(403)
+        .json({ ok: false, error: "Acesso não permitido a este funcionário" });
+    }
+
     await registrarLog({
       req,
       usuario,
       acao: "VIEW",
       tabela: "cadastro_func",
-      registro_id: id,
       depois: data,
-      observacao: "Consultou funcionário",
+      observacao: "Visualizou funcionário",
     });
 
     return res.json({ ok: true, data });
@@ -2529,7 +2570,9 @@ app.get("/obras/todas", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
 
-    if (!(isAdmin(usuario) || isFinanceiro(usuario))) {
+    if (
+      !(isAdmin(usuario) || isFinanceiro(usuario) || isEncarregado(usuario))
+    ) {
       return deny(
         res,
         "Apenas administrador ou financeiro pode ver todas as obras",
