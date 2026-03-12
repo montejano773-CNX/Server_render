@@ -50,12 +50,6 @@ function isEquipeEngenharia(funcao) {
   );
 }
 
-function podeVerFuncionaris(usuario, funcionario) {
-  if (isAdmin(usuario)) return true;
-
-  return !isEquipeEngenharia(funcionario?.funcao);
-}
-
 function podeVerFuncionario(usuario, funcionario) {
   if (isAdmin(usuario)) return true;
   return !isEquipeEngenharia(funcionario?.funcao);
@@ -1075,7 +1069,7 @@ app.get("/funcionarios", requireAuth, async (req, res) => {
 
     // aplica regra
     const filtrados = (data || []).filter((f) =>
-      podeVerFuncionarios(usuario, f),
+      podeVerFuncionario(usuario, f),
     );
 
     await registrarLog({
