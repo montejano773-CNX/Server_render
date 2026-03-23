@@ -3,12 +3,34 @@ import express from "express";
 import cors from "cors";
 import { requireAuth } from "./middlewares/auth.js";
 import { supabaseAdmin } from "./supabaseAdmin.js";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
 
 const app = express();
 
-// ==================================================
-// CORS
-// ==================================================
+app.set("trust proxy", 1);
+
+app.use(
+  helmet({
+    crossOriginResourcePolicy: { policy: "cross-origin" },
+  }),
+);
+
+app.use(express.json({ limit: "200kb" }));
+
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    ok: false,
+    error: "Muitas requisições. Tente novamente mais tarde.",
+  },
+});
+
+app.use(limiter);
+
 const allowedOrigins = (process.env.CORS_ORIGIN || "")
   .split(",")
   .map((s) => s.trim())
@@ -30,9 +52,6 @@ app.use(
   }),
 );
 
-app.options("*", cors());
-app.use(express.json());
-
 // ==================================================
 // HELPERS
 // ==================================================
@@ -41,6 +60,20 @@ app.use(express.json());
 // - admin vê tudo
 // - outros usuários NÃO veem função "EQUIPE ENGENHARIA"
 // --------------------------------------------------
+
+function limitarTexto(v, max) {
+  if (v === undefined || v === null) return null;
+
+  let s = String(v).trim();
+
+  if (!s) return null;
+
+  if (s.length > max) {
+    s = s.slice(0, max);
+  }
+
+  return s;
+}
 
 function isEquipeEngenharia(funcao) {
   return (
@@ -619,14 +652,15 @@ app.post("/usuarios", requireAuth, async (req, res) => {
       return deny(res, "Apenas administrador pode criar usuários");
     }
 
-    const nome = (req.body?.nome || "").trim();
-    const email = (req.body?.email || "").trim();
-    const senha = (req.body?.senha || "").trim();
-    const nivel_acesso = (req.body?.nivel_acesso || "encarregado").trim();
+    const nome = limitarTexto(req.body?.nome, 120);
+    const email = limitarTexto(req.body?.email, 160);
+    const senha = limitarTexto(req.body?.senha, 120);
+    const nivel_acesso = limitarTexto(
+      req.body?.nivel_acesso || "encarregado",
+      30,
+    );
+    const observacao = limitarTexto(req.body?.observacao, 1000);
     const situacao = normSituacao(req.body?.situacao, "ativo");
-    const observacao = req.body?.observacao
-      ? String(req.body.observacao).trim()
-      : null;
 
     if (!nome)
       return res.status(400).json({ ok: false, error: "nome é obrigatório" });
@@ -1154,20 +1188,24 @@ app.post("/funcionarios", requireAuth, async (req, res) => {
     }
 
     const payload = {
-      nome: (req.body?.nome || "").trim(),
-      funcao: req.body?.funcao?.trim?.() || null,
+      nome: limitarTexto(req.body?.nome, 120),
+      funcao: limitarTexto(req.body?.funcao, 80),
       valor_diaria: vdi ?? 0,
-      cpf: req.body?.cpf ? String(req.body.cpf).replace(/\D/g, "") : null,
-      rg: req.body?.rg ? String(req.body.rg).replace(/\D/g, "") : null,
+      cpf: req.body?.cpf
+        ? String(req.body.cpf).replace(/\D/g, "").slice(0, 20)
+        : null,
+      rg: req.body?.rg
+        ? String(req.body.rg).replace(/\D/g, "").slice(0, 20)
+        : null,
       situacao: normSituacao(req.body?.situacao, "ativo"),
-      razao_social: req.body?.razao_social?.trim?.() || null,
-      titular_conta: req.body?.titular_conta?.trim?.() || null,
-      banco: req.body?.banco?.trim?.() || null,
-      agencia: req.body?.agencia?.trim?.() || null,
-      conta: req.body?.conta?.trim?.() || null,
-      chave_pix_tipo: normChavePixTipo(req.body),
-      chave_pix: req.body?.chave_pix?.trim?.() || null,
-      observacao: req.body?.observacao?.trim?.() || null,
+      razao_social: limitarTexto(req.body?.razao_social, 150),
+      titular_conta: limitarTexto(req.body?.titular_conta, 150),
+      banco: limitarTexto(req.body?.banco, 80),
+      agencia: limitarTexto(req.body?.agencia, 20),
+      conta: limitarTexto(req.body?.conta, 30),
+      chave_pix_tipo: limitarTexto(normChavePixTipo(req.body), 30),
+      chave_pix: limitarTexto(req.body?.chave_pix, 120),
+      observacao: limitarTexto(req.body?.observacao, 1000),
     };
 
     if (!payload.nome) {
@@ -2273,9 +2311,7 @@ app.post("/empreitas", requireAuth, async (req, res) => {
     const funcionario_id = req.body?.funcionario_id;
     const data_pagamento = req.body?.data_pagamento;
     const valorRaw = req.body?.valor;
-    const descricao = req.body?.descricao
-      ? String(req.body.descricao).trim()
-      : null;
+    const descricao = limitarTexto(req.body?.descricao, 1000);
 
     if (!isUuid(obra_id)) {
       return res
@@ -2379,9 +2415,7 @@ app.put("/empreitas/:id", requireAuth, async (req, res) => {
     const funcionario_id = String(req.body?.funcionario_id || "").trim();
     const data_pagamento = String(req.body?.data_pagamento || "").trim();
     const valor = Number(req.body?.valor || 0);
-    const descricao = req.body?.descricao
-      ? String(req.body.descricao).trim()
-      : null;
+    const descricao = limitarTexto(req.body?.descricao, 1000);
 
     if (!isUuid(obra_id)) {
       return res
@@ -2656,17 +2690,13 @@ app.post("/obras", requireAuth, async (req, res) => {
       );
     }
 
-    const nome = String(req.body?.nome || "").trim();
-    const endereco = req.body?.endereco
-      ? String(req.body.endereco).trim()
-      : null;
-    const cidade = req.body?.cidade ? String(req.body.cidade).trim() : null;
-    const uf = req.body?.uf ? String(req.body.uf).trim().toUpperCase() : null;
+    const nome = limitarTexto(req.body?.nome, 120);
+    const endereco = limitarTexto(req.body?.endereco, 180);
+    const cidade = limitarTexto(req.body?.cidade, 80);
+    const uf = limitarTexto(req.body?.uf, 2)?.toUpperCase() || null;
     const responsavel = String(req.body?.responsavel || "").trim();
+    const observacao = limitarTexto(req.body?.observacao, 1000);
     const situacao = normSituacao(req.body?.situacao, "ativo");
-    const observacao = req.body?.observacao
-      ? String(req.body.observacao).trim()
-      : null;
 
     if (!nome) {
       return res
@@ -3062,9 +3092,9 @@ app.post("/quinzenas", requireAuth, async (req, res) => {
       );
     }
 
-    const nome = String(req.body?.nome || "").trim();
-    const data_inicio = String(req.body?.data_inicio || "").trim();
-    const data_fim = String(req.body?.data_fim || "").trim();
+    const nome = limitarTexto(req.body?.nome, 120);
+    const data_inicio = limitarTexto(req.body?.data_inicio, 10);
+    const data_fim = limitarTexto(req.body?.data_fim, 10);
 
     if (!nome) {
       return res
