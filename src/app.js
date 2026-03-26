@@ -1221,8 +1221,19 @@ app.post("/funcionarios", requireAuth, async (req, res) => {
       .single();
 
     if (error) {
+      if (error.code === "23505") {
+        return res.status(400).json({
+          ok: false,
+          error: "Já existe um funcionário com este CPF cadastrado",
+        });
+      }
+
       console.error("POST /funcionarios error:", error);
-      return res.status(500).json({ ok: false, error: error.message });
+
+      return res.status(500).json({
+        ok: false,
+        error: "Erro ao salvar funcionário",
+      });
     }
 
     const novo = await getFuncionarioById(data.id);
