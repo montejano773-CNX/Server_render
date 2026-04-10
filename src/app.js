@@ -335,6 +335,16 @@ async function getEquipeObraById(id) {
   if (error) return null;
   return data;
 }
+async function getEmpreiteiroById(id) {
+  const { data, error } = await supabaseAdmin
+    .from("cadastro_empreiteiro")
+    .select("*")
+    .eq("id", id)
+    .single();
+
+  if (error) return null;
+  return data;
+}
 
 async function getEmpreitaById(id) {
   const { data, error } = await supabaseAdmin
@@ -1743,6 +1753,205 @@ app.delete("/equipe-obra/:id", requireAuth, async (req, res) => {
     return res.json({ ok: true });
   } catch (err) {
     console.error("DELETE /equipe-obra/:id exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+// ==================================================
+// EMPREITEIROS CRUD
+// ==================================================
+app.get("/empreiteiros", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+
+    if (
+      !(isAdmin(usuario) || isFinanceiro(usuario) || isEncarregado(usuario))
+    ) {
+      return deny(
+        res,
+        "Apenas administrador, financeiro ou encarregado pode listar empreiteiros",
+      );
+    }
+
+    const { data, error } = await supabaseAdmin
+      .from("cadastro_empreiteiro")
+      .select("id, nome, funcionarios_ids, created_at")
+      .order("nome", { ascending: true });
+
+    if (error) {
+      console.error("GET /empreiteiros error:", error);
+      return res.status(500).json({
+        ok: false,
+        error: "Falha ao listar empreiteiros",
+      });
+    }
+
+    await registrarLog({
+      req,
+      usuario,
+      acao: "LIST",
+      tabela: "cadastro_empreiteiro",
+      depois: { total: (data || []).length },
+      observacao: "Listou empreiteiros",
+    });
+
+    return res.json({ ok: true, data: data || [] });
+  } catch (err) {
+    console.error("GET /empreiteiros exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
+app.get("/empreiteiros/:id", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    const id = String(req.params.id || "").trim();
+
+    if (
+      !(isAdmin(usuario) || isFinanceiro(usuario) || isEncarregado(usuario))
+    ) {
+      return deny(
+        res,
+        "Apenas administrador, financeiro ou encarregado pode consultar empreiteiro",
+      );
+    }
+
+    if (!isUuid(id)) {
+      return res.status(400).json({ ok: false, error: "id inválido (UUID)" });
+    }
+
+    const data = await getEmpreiteiroById(id);
+
+    if (!data) {
+      return res
+        .status(404)
+        .json({ ok: false, error: "Empreiteiro não encontrado" });
+    }
+
+    await registrarLog({
+      req,
+      usuario,
+      acao: "VIEW",
+      tabela: "cadastro_empreiteiro",
+      registro_id: id,
+      depois: data,
+      observacao: "Consultou empreiteiro",
+    });
+
+    return res.json({ ok: true, data });
+  } catch (err) {
+    console.error("GET /empreiteiros/:id exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
+app.post("/empreiteiros", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+
+    if (
+      !(isAdmin(usuario) || isFinanceiro(usuario) || isEncarregado(usuario))
+    ) {
+      return deny(
+        res,
+        "Apenas administrador, financeiro ou encarregado pode cadastrar empreiteiro",
+      );
+    }
+
+    const nome = limitarTexto(req.body?.nome, 150);
+    const funcionarios_ids_raw = Array.isArray(req.body?.funcionarios_ids)
+      ? req.body.funcionarios_ids
+      : null;
+
+    if (!nome) {
+      return res.status(400).json({
+        ok: false,
+        error: "Informe o nome do empreiteiro",
+      });
+    }
+
+    if (!funcionarios_ids_raw || funcionarios_ids_raw.length === 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "Informe ao menos um funcionário",
+      });
+    }
+
+    const funcionarios_ids = [
+      ...new Set(
+        funcionarios_ids_raw
+          .map((id) => String(id || "").trim())
+          .filter(Boolean),
+      ),
+    ];
+
+    for (const funcionarioId of funcionarios_ids) {
+      if (!isUuid(funcionarioId)) {
+        return res.status(400).json({
+          ok: false,
+          error: `funcionario_id inválido: ${funcionarioId}`,
+        });
+      }
+    }
+
+    const { data: funcionarios, error: funcErr } = await supabaseAdmin
+      .from("cadastro_func")
+      .select("id, nome, funcao, situacao")
+      .in("id", funcionarios_ids);
+
+    if (funcErr) {
+      console.error("POST /empreiteiros validate funcionarios error:", funcErr);
+      return res.status(500).json({
+        ok: false,
+        error: "Falha ao validar funcionários",
+      });
+    }
+
+    const funcionariosValidos = (funcionarios || []).filter((f) =>
+      podeVerFuncionario(usuario, f),
+    );
+
+    if (funcionariosValidos.length !== funcionarios_ids.length) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "Um ou mais funcionários informados não existem ou não podem ser vinculados",
+      });
+    }
+
+    const payload = {
+      nome: String(nome).trim().toUpperCase(),
+      funcionarios_ids,
+    };
+
+    const { data, error } = await supabaseAdmin
+      .from("cadastro_empreiteiro")
+      .insert(payload)
+      .select("id")
+      .single();
+
+    if (error) {
+      console.error("POST /empreiteiros error:", error);
+      return res.status(500).json({
+        ok: false,
+        error: "Erro ao salvar empreiteiro",
+      });
+    }
+
+    const depois = await getEmpreiteiroById(data.id);
+
+    await registrarLog({
+      req,
+      usuario,
+      acao: "INSERT",
+      tabela: "cadastro_empreiteiro",
+      registro_id: data.id,
+      depois,
+      observacao: `Criou empreiteiro ${payload.nome}`,
+    });
+
+    return res.status(201).json({ ok: true, data });
+  } catch (err) {
+    console.error("POST /empreiteiros exception:", err);
     return res.status(500).json({ ok: false, error: "Erro interno" });
   }
 });
