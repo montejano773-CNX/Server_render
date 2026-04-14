@@ -1955,6 +1955,261 @@ app.post("/empreiteiros", requireAuth, async (req, res) => {
     return res.status(500).json({ ok: false, error: "Erro interno" });
   }
 });
+app.put("/empreiteiros/:id", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    const id = String(req.params.id || "").trim();
+
+    if (
+      !(isAdmin(usuario) || isFinanceiro(usuario) || isEncarregado(usuario))
+    ) {
+      return deny(
+        res,
+        "Apenas administrador, financeiro ou encarregado pode atualizar empreiteiro",
+      );
+    }
+
+    if (!isUuid(id)) {
+      return res.status(400).json({ ok: false, error: "id inválido (UUID)" });
+    }
+
+    const antes = await getEmpreiteiroById(id);
+
+    if (!antes) {
+      return res
+        .status(404)
+        .json({ ok: false, error: "Empreiteiro não encontrado" });
+    }
+
+    const nome = limitarTexto(req.body?.nome, 150);
+    const funcionarios_ids_raw = Array.isArray(req.body?.funcionarios_ids)
+      ? req.body.funcionarios_ids
+      : null;
+
+    if (!nome) {
+      return res.status(400).json({
+        ok: false,
+        error: "Informe o nome do empreiteiro",
+      });
+    }
+
+    if (!funcionarios_ids_raw || funcionarios_ids_raw.length === 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "Informe ao menos um funcionário",
+      });
+    }
+
+    const funcionarios_ids = [
+      ...new Set(
+        funcionarios_ids_raw
+          .map((funcionarioId) => String(funcionarioId || "").trim())
+          .filter(Boolean),
+      ),
+    ];
+
+    for (const funcionarioId of funcionarios_ids) {
+      if (!isUuid(funcionarioId)) {
+        return res.status(400).json({
+          ok: false,
+          error: `funcionario_id inválido: ${funcionarioId}`,
+        });
+      }
+    }
+
+    const { data: funcionarios, error: funcErr } = await supabaseAdmin
+      .from("cadastro_func")
+      .select("id, nome, funcao, situacao")
+      .in("id", funcionarios_ids);
+
+    if (funcErr) {
+      console.error(
+        "PUT /empreiteiros/:id validate funcionarios error:",
+        funcErr,
+      );
+      return res.status(500).json({
+        ok: false,
+        error: "Falha ao validar funcionários",
+      });
+    }
+
+    const funcionariosValidos = (funcionarios || []).filter((f) =>
+      podeVerFuncionario(usuario, f),
+    );
+
+    if (funcionariosValidos.length !== funcionarios_ids.length) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "Um ou mais funcionários informados não existem ou não podem ser vinculados",
+      });
+    }
+
+    const payload = {
+      nome: String(nome).trim().toUpperCase(),
+      funcionarios_ids,
+    };
+
+    const { error } = await supabaseAdmin
+      .from("cadastro_empreiteiro")
+      .update(payload)
+      .eq("id", id);
+
+    if (error) {
+      console.error("PUT /empreiteiros/:id error:", error);
+      return res.status(500).json({
+        ok: false,
+        error: "Erro ao atualizar empreiteiro",
+      });
+    }
+
+    const depois = await getEmpreiteiroById(id);
+
+    await registrarLog({
+      req,
+      usuario,
+      acao: "UPDATE",
+      tabela: "cadastro_empreiteiro",
+      registro_id: id,
+      antes,
+      depois,
+      observacao: `Atualizou empreiteiro ${payload.nome}`,
+    });
+
+    return res.json({ ok: true, data: { id } });
+  } catch (err) {
+    console.error("PUT /empreiteiros/:id exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
+app.put("/empreiteiros/:id", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    const id = String(req.params.id || "").trim();
+
+    if (
+      !(isAdmin(usuario) || isFinanceiro(usuario) || isEncarregado(usuario))
+    ) {
+      return deny(
+        res,
+        "Apenas administrador, financeiro ou encarregado pode atualizar empreiteiro",
+      );
+    }
+
+    if (!isUuid(id)) {
+      return res.status(400).json({ ok: false, error: "id inválido (UUID)" });
+    }
+
+    const antes = await getEmpreiteiroById(id);
+
+    if (!antes) {
+      return res
+        .status(404)
+        .json({ ok: false, error: "Empreiteiro não encontrado" });
+    }
+
+    const nome = limitarTexto(req.body?.nome, 150);
+    const funcionarios_ids_raw = Array.isArray(req.body?.funcionarios_ids)
+      ? req.body.funcionarios_ids
+      : null;
+
+    if (!nome) {
+      return res.status(400).json({
+        ok: false,
+        error: "Informe o nome do empreiteiro",
+      });
+    }
+
+    if (!funcionarios_ids_raw || funcionarios_ids_raw.length === 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "Informe ao menos um funcionário",
+      });
+    }
+
+    const funcionarios_ids = [
+      ...new Set(
+        funcionarios_ids_raw
+          .map((funcionarioId) => String(funcionarioId || "").trim())
+          .filter(Boolean),
+      ),
+    ];
+
+    for (const funcionarioId of funcionarios_ids) {
+      if (!isUuid(funcionarioId)) {
+        return res.status(400).json({
+          ok: false,
+          error: `funcionario_id inválido: ${funcionarioId}`,
+        });
+      }
+    }
+
+    const { data: funcionarios, error: funcErr } = await supabaseAdmin
+      .from("cadastro_func")
+      .select("id, nome, funcao, situacao")
+      .in("id", funcionarios_ids);
+
+    if (funcErr) {
+      console.error(
+        "PUT /empreiteiros/:id validate funcionarios error:",
+        funcErr,
+      );
+      return res.status(500).json({
+        ok: false,
+        error: "Falha ao validar funcionários",
+      });
+    }
+
+    const funcionariosValidos = (funcionarios || []).filter((f) =>
+      podeVerFuncionario(usuario, f),
+    );
+
+    if (funcionariosValidos.length !== funcionarios_ids.length) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "Um ou mais funcionários informados não existem ou não podem ser vinculados",
+      });
+    }
+
+    const payload = {
+      nome: String(nome).trim().toUpperCase(),
+      funcionarios_ids,
+    };
+
+    const { error } = await supabaseAdmin
+      .from("cadastro_empreiteiro")
+      .update(payload)
+      .eq("id", id);
+
+    if (error) {
+      console.error("PUT /empreiteiros/:id error:", error);
+      return res.status(500).json({
+        ok: false,
+        error: "Erro ao atualizar empreiteiro",
+      });
+    }
+
+    const depois = await getEmpreiteiroById(id);
+
+    await registrarLog({
+      req,
+      usuario,
+      acao: "UPDATE",
+      tabela: "cadastro_empreiteiro",
+      registro_id: id,
+      antes,
+      depois,
+      observacao: `Atualizou empreiteiro ${payload.nome}`,
+    });
+
+    return res.json({ ok: true, data: { id } });
+  } catch (err) {
+    console.error("PUT /empreiteiros/:id exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
 
 // =====================================================
 // DIÁRIAS
