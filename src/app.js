@@ -2283,6 +2283,7 @@ app.post("/lanc-diarias", requireAuth, async (req, res) => {
     }
 
     const registros = req.body?.registros;
+
     if (!Array.isArray(registros) || registros.length === 0) {
       return res
         .status(400)
@@ -2303,18 +2304,168 @@ app.post("/lanc-diarias", requireAuth, async (req, res) => {
       const qtd = Number(r.qtd);
       const vda = Number(r.valor_diaria_aplicado);
 
-      if (!Number.isFinite(qtd)) throw new Error("qtd inválido.");
-      if (!Number.isFinite(vda) || vda <= 0)
-        throw new Error("valor_diaria_aplicado inválido.");
+      if (!Number.isFinite(qtd)) {
+        throw new Error("qtd inválido.");
+      }
 
-      return { obra_id, funcionario_id, data, qtd, valor_diaria_aplicado: vda };
+      // NOVA REGRA:
+      // cada lançamento individual só pode ir de 0,0 até 1,0
+      if (qtd < 0 || qtd > 1) {
+        throw new Error("A diária precisa estar entre 0,0 e 1,0.");
+      }
+
+      if (!Number.isFinite(vda) || vda <= 0) {
+        throw new Error("valor_diaria_aplicado inválido.");
+      }
+
+      return {
+        obra_id,
+        funcionario_id,
+        data,
+        qtd,
+        valor_diaria_aplicado: vda,
+      };
     });
 
     const obraIds = [...new Set(normalized.map((r) => r.obra_id))];
+
     for (const obraId of obraIds) {
       const pode = await usuarioPodeAcessarObra(usuario, obraId);
+
       if (!pode) {
         return deny(res, "Você não pode lançar diárias nesta obra");
+      }
+    }
+
+    // ==================================================
+    // NOVA VALIDAÇÃO:
+    // funcionário não pode passar de 1,0 diária somando
+    // todas as obras no mesmo dia.
+    // ==================================================
+
+    const funcIds = [...new Set(normalized.map((r) => r.funcionario_id))];
+    const datas = [...new Set(normalized.map((r) => r.data))];
+
+    const { data: existentes, error: errExistentes } = await supabaseAdmin
+      .from("lanc_diarias")
+      .select("obra_id, funcionario_id, data, qtd")
+      .in("funcionario_id", funcIds)
+      .in("data", datas);
+
+    if (errExistentes) {
+      console.error(
+        "POST /lanc-diarias buscar existentes error:",
+        errExistentes,
+      );
+      return res.status(500).json({
+        ok: false,
+        error: "Erro ao validar diárias já lançadas",
+      });
+    }
+
+    const { data: obrasExistentes, error: errObrasExistentes } =
+      await supabaseAdmin
+        .from("cadastro_obra")
+        .select("id, nome")
+        .in("id", [
+          ...new Set(
+            (existentes || [])
+              .map((r) => r.obra_id)
+              .concat(normalized.map((r) => r.obra_id))
+              .filter(Boolean),
+          ),
+        ]);
+
+    if (errObrasExistentes) {
+      console.error(
+        "POST /lanc-diarias buscar obras error:",
+        errObrasExistentes,
+      );
+    }
+
+    const mapaObras = {};
+    (obrasExistentes || []).forEach((o) => {
+      mapaObras[o.id] = o.nome;
+    });
+
+    const mapaPayload = {};
+
+    normalized.forEach((r) => {
+      const chave = `${r.funcionario_id}_${r.data}_${r.obra_id}`;
+      mapaPayload[chave] = r;
+    });
+
+    const somaPorFuncionarioDia = {};
+
+    // Soma o que já existe no banco, exceto os registros que serão substituídos
+    // pelo payload atual.
+    (existentes || []).forEach((r) => {
+      const chaveRegistro = `${r.funcionario_id}_${r.data}_${r.obra_id}`;
+
+      if (mapaPayload[chaveRegistro]) {
+        return;
+      }
+
+      const chaveDia = `${r.funcionario_id}_${r.data}`;
+
+      if (!somaPorFuncionarioDia[chaveDia]) {
+        somaPorFuncionarioDia[chaveDia] = {
+          total: 0,
+          detalhes: [],
+        };
+      }
+
+      somaPorFuncionarioDia[chaveDia].total += Number(r.qtd || 0);
+
+      if (Number(r.qtd || 0) > 0) {
+        somaPorFuncionarioDia[chaveDia].detalhes.push({
+          obra_id: r.obra_id,
+          obra_nome: mapaObras[r.obra_id] || "obra não identificada",
+          qtd: Number(r.qtd || 0),
+        });
+      }
+    });
+
+    // Soma o que está vindo agora do front.
+    normalized.forEach((r) => {
+      const chaveDia = `${r.funcionario_id}_${r.data}`;
+
+      if (!somaPorFuncionarioDia[chaveDia]) {
+        somaPorFuncionarioDia[chaveDia] = {
+          total: 0,
+          detalhes: [],
+        };
+      }
+
+      somaPorFuncionarioDia[chaveDia].total += Number(r.qtd || 0);
+
+      if (Number(r.qtd || 0) > 0) {
+        somaPorFuncionarioDia[chaveDia].detalhes.push({
+          obra_id: r.obra_id,
+          obra_nome: mapaObras[r.obra_id] || "obra atual",
+          qtd: Number(r.qtd || 0),
+        });
+      }
+    });
+
+    for (const [chaveDia, info] of Object.entries(somaPorFuncionarioDia)) {
+      if (info.total > 1.000001) {
+        const [funcionarioId, data] = chaveDia.split("_");
+
+        const funcionario = await getFuncionarioById(funcionarioId);
+        const nomeFuncionario = funcionario?.nome || "Funcionário";
+
+        const detalhe = info.detalhes
+          .map(
+            (d) =>
+              `${d.qtd.toFixed(1).replace(".", ",")} na obra ${d.obra_nome}`,
+          )
+          .join(" + ");
+
+        return res.status(409).json({
+          ok: false,
+          error: `${nomeFuncionario} já possui lançamento no dia ${data}: ${detalhe}. O total diário não pode ultrapassar 1,0. Altere o lançamento existente antes de salvar.`,
+        });
       }
     }
 
