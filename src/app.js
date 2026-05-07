@@ -985,7 +985,7 @@ app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
     let qAjustes = supabaseAdmin
       .from("lanc_diarias_ajustes")
       .select(
-        "obra_id, funcionario_id, data_inicio, reembolso, adiantamento, observacao, valor",
+        "obra_id, funcionario_id, data_inicio, quinzena_id, data_adiantamento, reembolso, adiantamento, observacao, valor",
       )
       .gte("data_inicio", inicio)
       .lte("data_inicio", fim);
@@ -2489,21 +2489,25 @@ app.post("/diarias-ajustes", requireAuth, async (req, res) => {
       }
 
       const reembolso_centavos = Number(a.reembolso_centavos ?? 0);
-      const adiantamento_centavos = Number(a.adiantamento_centavos ?? 0);
+      const adiantamento_centavos =
+        a.adiantamento_centavos === undefined
+          ? null
+          : Number(a.adiantamento_centavos ?? 0);
 
       if (!Number.isFinite(reembolso_centavos) || reembolso_centavos < 0) {
         throw new Error("reembolso_centavos inválido.");
       }
 
       if (
-        !Number.isFinite(adiantamento_centavos) ||
-        adiantamento_centavos < 0
+        adiantamento_centavos !== null &&
+        (!Number.isFinite(adiantamento_centavos) || adiantamento_centavos < 0)
       ) {
         throw new Error("adiantamento_centavos inválido.");
       }
 
       const reembolso = reembolso_centavos / 100;
-      const adiantamento = adiantamento_centavos / 100;
+      const adiantamento =
+        adiantamento_centavos === null ? null : adiantamento_centavos / 100;
 
       const valor = Number(a.valor ?? 0);
       if (!Number.isFinite(valor) || valor < 0) {
@@ -2532,6 +2536,41 @@ app.post("/diarias-ajustes", requireAuth, async (req, res) => {
       if (!pode) {
         return deny(res, "Você não pode salvar ajustes nesta obra");
       }
+    }
+
+    if (normalized.some((a) => a.adiantamento === null)) {
+      const datas = [...new Set(normalized.map((a) => a.data_inicio))];
+      const funcIds = [...new Set(normalized.map((a) => a.funcionario_id))];
+      const { data: existentes, error: errExistentes } = await supabaseAdmin
+        .from("lanc_diarias_ajustes")
+        .select("obra_id, funcionario_id, data_inicio, adiantamento")
+        .in("obra_id", obraIds)
+        .in("funcionario_id", funcIds)
+        .in("data_inicio", datas);
+
+      if (errExistentes) {
+        console.error(
+          "POST /diarias-ajustes preservar adiantamento:",
+          errExistentes,
+        );
+        return res.status(500).json({
+          ok: false,
+          error: "Erro ao preservar adiantamentos existentes",
+        });
+      }
+
+      const mapExistentes = new Map(
+        (existentes || []).map((r) => [
+          `${r.obra_id}_${r.funcionario_id}_${r.data_inicio}`,
+          Number(r.adiantamento || 0),
+        ]),
+      );
+
+      normalized.forEach((a) => {
+        if (a.adiantamento !== null) return;
+        const key = `${a.obra_id}_${a.funcionario_id}_${a.data_inicio}`;
+        a.adiantamento = mapExistentes.get(key) || 0;
+      });
     }
 
     const { error } = await supabaseAdmin
@@ -2566,6 +2605,378 @@ app.post("/diarias-ajustes", requireAuth, async (req, res) => {
 // =====================================================
 // FUNCIONÁRIOS VINCULADOS
 // =====================================================
+// =====================================================
+// ADIANTAMENTOS
+// =====================================================
+function podeGerenciarAdiantamento(usuario) {
+  return isAdmin(usuario) || isFinanceiro(usuario) || isEncarregado(usuario);
+}
+
+function normalizarAdiantamentoPayload(body) {
+  const obra_id = String(body?.obra_id || "").trim();
+  const funcionario_id = String(body?.funcionario_id || "").trim();
+  const quinzena_id = String(body?.quinzena_id || "").trim();
+  const data_adiantamento = String(
+    body?.data_adiantamento || "",
+  )
+    .trim()
+    .slice(0, 10);
+  const valor_centavos = Number(body?.valor_centavos ?? 0);
+  const observacao =
+    body?.observacao !== undefined && body?.observacao !== null
+      ? String(body.observacao).trim()
+      : null;
+
+  if (
+    !isUuid(obra_id) ||
+    !isUuid(funcionario_id) ||
+    !isUuid(quinzena_id) ||
+    !data_adiantamento
+  ) {
+    throw new Error(
+      "Informe funcionário, obra e data do adiantamento corretamente.",
+    );
+  }
+
+  if (!Number.isFinite(valor_centavos) || valor_centavos <= 0) {
+    throw new Error("Informe um valor de adiantamento maior que zero.");
+  }
+
+  return {
+    obra_id,
+    funcionario_id,
+    quinzena_id,
+    data_adiantamento,
+    adiantamento: valor_centavos / 100,
+    observacao,
+  };
+}
+
+async function buscarAdiantamentoLancamento({
+  obra_id,
+  funcionario_id,
+  quinzena_id,
+  data_adiantamento,
+}) {
+  const { data, error } = await supabaseAdmin
+    .from("lanc_diarias_ajustes")
+    .select(
+      "obra_id, funcionario_id, data_inicio, quinzena_id, data_adiantamento, reembolso, adiantamento, observacao, valor",
+    )
+    .eq("obra_id", obra_id)
+    .eq("funcionario_id", funcionario_id)
+    .eq("quinzena_id", quinzena_id)
+    .eq("data_adiantamento", data_adiantamento)
+    .maybeSingle();
+
+  if (error) throw error;
+  return data || null;
+}
+
+async function upsertAdiantamentoLancamento(payload) {
+  const existente = await buscarAdiantamentoLancamento(payload);
+  const registro = {
+    obra_id: payload.obra_id,
+    funcionario_id: payload.funcionario_id,
+    quinzena_id: payload.quinzena_id,
+    data_adiantamento: payload.data_adiantamento,
+    reembolso: Number(existente?.reembolso || 0),
+    adiantamento: Number(payload.adiantamento || 0),
+    observacao: payload.observacao || existente?.observacao || null,
+    valor: Number(existente?.valor || 0),
+  };
+
+  const { error } = existente
+    ? await supabaseAdmin
+        .from("lanc_diarias_ajustes")
+        .update(registro)
+        .eq("obra_id", payload.obra_id)
+        .eq("funcionario_id", payload.funcionario_id)
+        .eq("quinzena_id", payload.quinzena_id)
+        .eq("data_adiantamento", payload.data_adiantamento)
+    : await supabaseAdmin.from("lanc_diarias_ajustes").insert([registro]);
+
+  if (error) throw error;
+  return { antes: existente, depois: registro };
+}
+
+app.get("/adiantamentos", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    if (!podeGerenciarAdiantamento(usuario)) {
+      return deny(res, "Sem permissão para listar adiantamentos");
+    }
+
+    const data_inicio = String(req.query?.data_inicio || "").trim();
+    const data_fim = String(req.query?.data_fim || "").trim();
+    const quinzena_id = String(req.query?.quinzena_id || "").trim();
+    const obra_id = String(req.query?.obra_id || "").trim();
+
+    let query = supabaseAdmin
+      .from("lanc_diarias_ajustes")
+      .select(
+        "obra_id, funcionario_id, data_inicio, quinzena_id, data_adiantamento, reembolso, adiantamento, observacao, valor",
+      )
+      .gt("adiantamento", 0)
+      .order("data_adiantamento", { ascending: false });
+
+    if (isUuid(quinzena_id)) query = query.eq("quinzena_id", quinzena_id);
+    if (!isUuid(quinzena_id) && data_inicio) {
+      query = query.gte("data_adiantamento", data_inicio);
+    }
+    if (!isUuid(quinzena_id) && data_fim) {
+      query = query.lte("data_adiantamento", data_fim);
+    }
+    if (isUuid(obra_id)) query = query.eq("obra_id", obra_id);
+
+    const permitidas = await getIdsObrasVisiveisUsuario(usuario);
+    if (!isAdmin(usuario) && !permitidas.length) {
+      return res.json({ ok: true, data: [] });
+    }
+    if (!isAdmin(usuario) && permitidas.length) {
+      query = query.in("obra_id", permitidas);
+    }
+
+    const { data, error } = await query;
+    if (error) throw error;
+
+    const obraIds = [...new Set((data || []).map((r) => r.obra_id))];
+    const funcIds = [...new Set((data || []).map((r) => r.funcionario_id))];
+
+    const [{ data: obras }, { data: funcs }] = await Promise.all([
+      obraIds.length
+        ? supabaseAdmin
+            .from("cadastro_obra")
+            .select("id, nome")
+            .in("id", obraIds)
+        : Promise.resolve({ data: [] }),
+      funcIds.length
+        ? supabaseAdmin
+            .from("cadastro_func")
+            .select("id, nome, funcao")
+            .in("id", funcIds)
+        : Promise.resolve({ data: [] }),
+    ]);
+
+    const mapObras = Object.fromEntries((obras || []).map((o) => [o.id, o]));
+    const mapFuncs = Object.fromEntries((funcs || []).map((f) => [f.id, f]));
+    const out = (data || []).map((r) => ({
+      ...r,
+      data_adiantamento: r.data_adiantamento || r.data_inicio,
+      obra_nome: mapObras[r.obra_id]?.nome || "",
+      funcionario_nome: mapFuncs[r.funcionario_id]?.nome || "",
+      funcionario_funcao: mapFuncs[r.funcionario_id]?.funcao || "",
+    }));
+
+    await registrarLog({
+      req,
+      usuario,
+      acao: "LIST",
+      tabela: "lanc_diarias_ajustes",
+      depois: { total: out.length, quinzena_id, data_inicio, data_fim, obra_id },
+      observacao: "Listou adiantamentos",
+    });
+
+    return res.json({ ok: true, data: out });
+  } catch (e) {
+    console.error("GET /adiantamentos exception:", e);
+    return res
+      .status(500)
+      .json({ ok: false, error: "Erro ao listar adiantamentos" });
+  }
+});
+
+app.post("/adiantamentos", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    if (!podeGerenciarAdiantamento(usuario)) {
+      return deny(res, "Sem permissão para lançar adiantamento");
+    }
+
+    const payload = normalizarAdiantamentoPayload(req.body);
+    const pode = await usuarioPodeAcessarObra(usuario, payload.obra_id);
+    if (!pode) return deny(res, "Você não pode lançar nesta obra");
+
+    const salvo = await upsertAdiantamentoLancamento(payload);
+
+    await registrarLog({
+      req,
+      usuario,
+      acao: "UPSERT",
+      tabela: "lanc_diarias_ajustes",
+      registro_id: `${payload.obra_id}:${payload.funcionario_id}:${payload.quinzena_id}:${payload.data_adiantamento}`,
+      antes: salvo.antes,
+      depois: salvo.depois,
+      observacao: "Salvou lançamento de adiantamento",
+    });
+
+    return res.json({ ok: true, data: salvo.depois });
+  } catch (e) {
+    console.error("POST /adiantamentos exception:", e);
+    return res
+      .status(400)
+      .json({ ok: false, error: e.message || "Erro ao salvar adiantamento" });
+  }
+});
+
+app.put("/adiantamentos", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    if (!podeGerenciarAdiantamento(usuario)) {
+      return deny(res, "Sem permissão para editar adiantamento");
+    }
+
+    const original = {
+      obra_id: String(req.body?.original?.obra_id || "").trim(),
+      funcionario_id: String(req.body?.original?.funcionario_id || "").trim(),
+      quinzena_id: String(req.body?.original?.quinzena_id || "").trim(),
+      data_adiantamento: String(
+        req.body?.original?.data_adiantamento || "",
+      )
+        .trim()
+        .slice(0, 10),
+    };
+    const payload = normalizarAdiantamentoPayload(
+      req.body?.adiantamento || req.body,
+    );
+
+    const podeOriginal = await usuarioPodeAcessarObra(usuario, original.obra_id);
+    const podeNovo = await usuarioPodeAcessarObra(usuario, payload.obra_id);
+    if (!podeOriginal || !podeNovo) {
+      return deny(res, "Você não pode editar este adiantamento");
+    }
+
+    const mudouChave =
+      original.obra_id !== payload.obra_id ||
+      original.funcionario_id !== payload.funcionario_id ||
+      original.quinzena_id !== payload.quinzena_id ||
+      original.data_adiantamento !== payload.data_adiantamento;
+    const antes = await buscarAdiantamentoLancamento(original);
+
+    if (mudouChave && antes) {
+      const manterLinha =
+        Number(antes.reembolso || 0) > 0 || Number(antes.valor || 0) > 0;
+      const { error } = manterLinha
+        ? await supabaseAdmin
+            .from("lanc_diarias_ajustes")
+            .update({
+              adiantamento: 0,
+              quinzena_id: null,
+              data_adiantamento: null,
+            })
+            .eq("obra_id", original.obra_id)
+            .eq("funcionario_id", original.funcionario_id)
+            .eq("quinzena_id", original.quinzena_id)
+            .eq("data_adiantamento", original.data_adiantamento)
+        : await supabaseAdmin
+            .from("lanc_diarias_ajustes")
+            .delete()
+            .eq("obra_id", original.obra_id)
+            .eq("funcionario_id", original.funcionario_id)
+            .eq("quinzena_id", original.quinzena_id)
+            .eq("data_adiantamento", original.data_adiantamento);
+      if (error) throw error;
+    }
+
+    const salvo = await upsertAdiantamentoLancamento(payload);
+
+    await registrarLog({
+      req,
+      usuario,
+      acao: "UPDATE",
+      tabela: "lanc_diarias_ajustes",
+      antes,
+      depois: salvo.depois,
+      observacao: "Editou lançamento de adiantamento",
+    });
+
+    return res.json({ ok: true, data: salvo.depois });
+  } catch (e) {
+    console.error("PUT /adiantamentos exception:", e);
+    return res
+      .status(400)
+      .json({ ok: false, error: e.message || "Erro ao editar adiantamento" });
+  }
+});
+
+app.delete("/adiantamentos", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    if (!podeGerenciarAdiantamento(usuario)) {
+      return deny(res, "Sem permissão para excluir adiantamento");
+    }
+
+    const original = {
+      obra_id: String(req.query?.obra_id || "").trim(),
+      funcionario_id: String(req.query?.funcionario_id || "").trim(),
+      quinzena_id: String(req.query?.quinzena_id || "").trim(),
+      data_adiantamento: String(req.query?.data_adiantamento || "")
+        .trim()
+        .slice(0, 10),
+    };
+
+    if (
+      !isUuid(original.obra_id) ||
+      !isUuid(original.funcionario_id) ||
+      !isUuid(original.quinzena_id) ||
+      !original.data_adiantamento
+    ) {
+      return res.status(400).json({ ok: false, error: "Parâmetros inválidos" });
+    }
+
+    const pode = await usuarioPodeAcessarObra(usuario, original.obra_id);
+    if (!pode) return deny(res, "Você não pode excluir este adiantamento");
+
+    const antes = await buscarAdiantamentoLancamento(original);
+    if (!antes) return res.json({ ok: true });
+
+    const manterLinha =
+      Number(antes.reembolso || 0) > 0 || Number(antes.valor || 0) > 0;
+    const { error } = manterLinha
+      ? await supabaseAdmin
+          .from("lanc_diarias_ajustes")
+          .update({
+            adiantamento: 0,
+            quinzena_id: null,
+            data_adiantamento: null,
+          })
+          .eq("obra_id", original.obra_id)
+          .eq("funcionario_id", original.funcionario_id)
+          .eq("quinzena_id", original.quinzena_id)
+          .eq("data_adiantamento", original.data_adiantamento)
+      : await supabaseAdmin
+          .from("lanc_diarias_ajustes")
+          .delete()
+          .eq("obra_id", original.obra_id)
+          .eq("funcionario_id", original.funcionario_id)
+          .eq("quinzena_id", original.quinzena_id)
+          .eq("data_adiantamento", original.data_adiantamento);
+    if (error) throw error;
+
+    await registrarLog({
+      req,
+      usuario,
+      acao: "DELETE",
+      tabela: "lanc_diarias_ajustes",
+      antes,
+      depois: {
+        ...antes,
+        adiantamento: 0,
+        quinzena_id: null,
+        data_adiantamento: null,
+      },
+      observacao: "Excluiu lançamento de adiantamento",
+    });
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("DELETE /adiantamentos exception:", e);
+    return res
+      .status(400)
+      .json({ ok: false, error: e.message || "Erro ao excluir adiantamento" });
+  }
+});
+
 app.get("/funcionarios-vinculados", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
@@ -3933,7 +4344,7 @@ app.get("/relatorios/obras", requireAuth, async (req, res) => {
 
     const { data: ajustes, error: errAjustes } = await supabaseAdmin
       .from("lanc_diarias_ajustes")
-      .select("obra_id, funcionario_id, data_inicio, reembolso, adiantamento")
+      .select("obra_id, funcionario_id, data_inicio, quinzena_id, data_adiantamento, reembolso, adiantamento")
       .in("obra_id", obraIds)
       .gte("data_inicio", inicio)
       .lte("data_inicio", fim);
