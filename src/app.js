@@ -987,8 +987,9 @@ app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
       .select(
         "obra_id, funcionario_id, data_inicio, quinzena_id, data_adiantamento, reembolso, adiantamento, observacao, valor",
       )
-      .gte("data_inicio", inicio)
-      .lte("data_inicio", fim);
+      .or(
+        `and(data_inicio.gte.${inicio},data_inicio.lte.${fim}),and(data_adiantamento.gte.${inicio},data_adiantamento.lte.${fim})`,
+      );
 
     if (obraIdsPermitidas) {
       qAjustes = qAjustes.in("obra_id", obraIdsPermitidas);
@@ -4346,8 +4347,9 @@ app.get("/relatorios/obras", requireAuth, async (req, res) => {
       .from("lanc_diarias_ajustes")
       .select("obra_id, funcionario_id, data_inicio, quinzena_id, data_adiantamento, reembolso, adiantamento")
       .in("obra_id", obraIds)
-      .gte("data_inicio", inicio)
-      .lte("data_inicio", fim);
+      .or(
+        `and(data_inicio.gte.${inicio},data_inicio.lte.${fim}),and(data_adiantamento.gte.${inicio},data_adiantamento.lte.${fim})`,
+      );
 
     if (errAjustes) {
       console.error("GET /relatorios/obras ajustes error:", errAjustes);
