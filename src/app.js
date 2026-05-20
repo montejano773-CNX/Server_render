@@ -1094,6 +1094,341 @@ app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
 // ==================================================
 // FUNCIONÁRIOS CRUD
 // ==================================================
+// ==================================================
+// FINANCEIRO
+// ==================================================
+function podeGerenciarFinanceiro(usuario) {
+  return isAdmin(usuario) || isFinanceiro(usuario);
+}
+
+function normalizarValorFinanceiro(body) {
+  const rawCentavos = body?.valor_centavos;
+  if (rawCentavos !== undefined && rawCentavos !== null && rawCentavos !== "") {
+    const n = Number(rawCentavos);
+    if (!Number.isFinite(n) || n < 0) throw new Error("Valor inválido");
+    return Math.round(n) / 100;
+  }
+
+  const n = Number(String(body?.valor ?? "").replace(",", "."));
+  if (!Number.isFinite(n) || n < 0) throw new Error("Valor inválido");
+  return n;
+}
+
+function normalizarStatusFinanceiro(v) {
+  const s = String(v || "pendente").trim().toLowerCase();
+  return ["pendente", "pago", "cancelado"].includes(s) ? s : "pendente";
+}
+
+function normalizarTipoFornecedor(v) {
+  const s = String(v || "fornecedor").trim().toLowerCase();
+  return ["fornecedor", "prestador", "outro"].includes(s) ? s : "fornecedor";
+}
+
+function normalizarFornecedorPayload(body = {}) {
+  const nome = limitarTexto(body.nome, 180);
+  if (!nome) throw new Error("Informe o nome do fornecedor");
+
+  return {
+    nome: nome.toUpperCase(),
+    documento: limitarTexto(body.documento, 40),
+    telefone: limitarTexto(body.telefone, 40),
+    email: limitarTexto(body.email, 180),
+    tipo: normalizarTipoFornecedor(body.tipo),
+    observacao: limitarTexto(body.observacao, 500),
+    situacao: normSituacao(body.situacao),
+  };
+}
+
+function normalizarLancamentoFinanceiroPayload(body = {}, { exigeObra = false } = {}) {
+  const descricao = limitarTexto(body.descricao, 220);
+  const data_lancamento = limitarTexto(body.data_lancamento, 10);
+  const obra_id = String(body.obra_id || "").trim();
+  const fornecedor_id = String(body.fornecedor_id || "").trim();
+
+  if (exigeObra && !isUuid(obra_id)) throw new Error("Informe a obra");
+  if (!descricao) throw new Error("Informe a descrição");
+  if (!data_lancamento) throw new Error("Informe a data do lançamento");
+  if (fornecedor_id && !isUuid(fornecedor_id)) throw new Error("Fornecedor inválido");
+
+  const payload = {
+    fornecedor_id: fornecedor_id || null,
+    data_lancamento,
+    data_vencimento: limitarTexto(body.data_vencimento, 10),
+    data_pagamento: limitarTexto(body.data_pagamento, 10),
+    descricao,
+    categoria: limitarTexto(body.categoria, 120),
+    valor: normalizarValorFinanceiro(body),
+    status: normalizarStatusFinanceiro(body.status),
+    forma_pagamento: limitarTexto(body.forma_pagamento, 80),
+    numero_documento: limitarTexto(body.numero_documento, 80),
+    observacao: limitarTexto(body.observacao, 500),
+  };
+
+  if (exigeObra) payload.obra_id = obra_id;
+  return payload;
+}
+
+app.get("/financeiro/fornecedores", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    if (!podeGerenciarFinanceiro(usuario)) return deny(res, "Sem permissão para acessar fornecedores");
+
+    const situacao = String(req.query?.situacao || "").trim().toLowerCase();
+    let query = supabaseAdmin.from("financeiro_fornecedores").select("*").order("nome", { ascending: true });
+    if (["ativo", "inativo"].includes(situacao)) query = query.eq("situacao", situacao);
+
+    const { data, error } = await query;
+    if (error) throw error;
+    return res.json({ ok: true, data: data || [] });
+  } catch (err) {
+    console.error("GET /financeiro/fornecedores exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro ao listar fornecedores" });
+  }
+});
+
+app.post("/financeiro/fornecedores", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    if (!podeGerenciarFinanceiro(usuario)) return deny(res, "Sem permissão para cadastrar fornecedor");
+
+    const payload = normalizarFornecedorPayload(req.body);
+    const { data, error } = await supabaseAdmin.from("financeiro_fornecedores").insert(payload).select("*").single();
+    if (error) throw error;
+    await registrarLog({ req, usuario, acao: "CREATE", tabela: "financeiro_fornecedores", registro_id: data?.id, depois: data, observacao: "Cadastrou fornecedor financeiro" });
+    return res.status(201).json({ ok: true, data });
+  } catch (err) {
+    console.error("POST /financeiro/fornecedores exception:", err);
+    return res.status(400).json({ ok: false, error: err.message || "Erro ao salvar fornecedor" });
+  }
+});
+
+app.put("/financeiro/fornecedores/:id", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    const id = String(req.params.id || "").trim();
+    if (!podeGerenciarFinanceiro(usuario)) return deny(res, "Sem permissão para editar fornecedor");
+    if (!isUuid(id)) return res.status(400).json({ ok: false, error: "ID inválido" });
+
+    const { data: antes } = await supabaseAdmin.from("financeiro_fornecedores").select("*").eq("id", id).maybeSingle();
+    const payload = normalizarFornecedorPayload(req.body);
+    const { data, error } = await supabaseAdmin.from("financeiro_fornecedores").update(payload).eq("id", id).select("*").single();
+    if (error) throw error;
+    await registrarLog({ req, usuario, acao: "UPDATE", tabela: "financeiro_fornecedores", registro_id: id, antes, depois: data, observacao: "Editou fornecedor financeiro" });
+    return res.json({ ok: true, data });
+  } catch (err) {
+    console.error("PUT /financeiro/fornecedores/:id exception:", err);
+    return res.status(400).json({ ok: false, error: err.message || "Erro ao editar fornecedor" });
+  }
+});
+
+app.delete("/financeiro/fornecedores/:id", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    const id = String(req.params.id || "").trim();
+    if (!isAdmin(usuario)) return deny(res, "Apenas administrador pode excluir fornecedor");
+    if (!isUuid(id)) return res.status(400).json({ ok: false, error: "ID inválido" });
+
+    const { data: antes } = await supabaseAdmin.from("financeiro_fornecedores").select("*").eq("id", id).maybeSingle();
+    const { error } = await supabaseAdmin.from("financeiro_fornecedores").delete().eq("id", id);
+    if (error) throw error;
+    await registrarLog({ req, usuario, acao: "DELETE", tabela: "financeiro_fornecedores", registro_id: id, antes, observacao: "Excluiu fornecedor financeiro" });
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("DELETE /financeiro/fornecedores/:id exception:", err);
+    return res.status(400).json({ ok: false, error: err.message || "Erro ao excluir fornecedor" });
+  }
+});
+
+async function montarQueryLancamentosObra(usuario, req) {
+  const obra_id = String(req.query?.obra_id || "").trim();
+  const fornecedor_id = String(req.query?.fornecedor_id || "").trim();
+  const status = String(req.query?.status || "").trim().toLowerCase();
+  const inicio = String(req.query?.inicio || "").trim();
+  const fim = String(req.query?.fim || "").trim();
+
+  let query = supabaseAdmin
+    .from("financeiro_lancamentos_obra")
+    .select("*")
+    .order("data_lancamento", { ascending: false })
+    .order("created_at", { ascending: false });
+
+  if (isUuid(obra_id)) {
+    const pode = await usuarioPodeAcessarObra(usuario, obra_id);
+    if (!pode) return { negado: true };
+    query = query.eq("obra_id", obra_id);
+  } else if (!isAdmin(usuario)) {
+    const obraIds = await getIdsObrasVisiveisUsuario(usuario);
+    if (!obraIds.length) return { vazio: true };
+    query = query.in("obra_id", obraIds);
+  }
+
+  if (isUuid(fornecedor_id)) query = query.eq("fornecedor_id", fornecedor_id);
+  if (["pendente", "pago", "cancelado"].includes(status)) query = query.eq("status", status);
+  if (inicio) query = query.gte("data_lancamento", inicio);
+  if (fim) query = query.lte("data_lancamento", fim);
+  return { query };
+}
+
+app.get("/financeiro/lancamentos-obra", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    if (!podeGerenciarFinanceiro(usuario)) return deny(res, "Sem permissão para acessar lançamentos de obra");
+
+    const montado = await montarQueryLancamentosObra(usuario, req);
+    if (montado.negado) return deny(res, "Você não pode consultar esta obra");
+    if (montado.vazio) return res.json({ ok: true, data: [] });
+
+    const { data, error } = await montado.query;
+    if (error) throw error;
+    return res.json({ ok: true, data: data || [] });
+  } catch (err) {
+    console.error("GET /financeiro/lancamentos-obra exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro ao listar lançamentos de obra" });
+  }
+});
+
+app.post("/financeiro/lancamentos-obra", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    if (!podeGerenciarFinanceiro(usuario)) return deny(res, "Sem permissão para lançar custo de obra");
+
+    const payload = normalizarLancamentoFinanceiroPayload(req.body, { exigeObra: true });
+    const pode = await usuarioPodeAcessarObra(usuario, payload.obra_id);
+    if (!pode) return deny(res, "Você não pode lançar nesta obra");
+
+    const { data, error } = await supabaseAdmin.from("financeiro_lancamentos_obra").insert(payload).select("*").single();
+    if (error) throw error;
+    await registrarLog({ req, usuario, acao: "CREATE", tabela: "financeiro_lancamentos_obra", registro_id: data?.id, depois: data, observacao: "Lançou custo financeiro vinculado à obra" });
+    return res.status(201).json({ ok: true, data });
+  } catch (err) {
+    console.error("POST /financeiro/lancamentos-obra exception:", err);
+    return res.status(400).json({ ok: false, error: err.message || "Erro ao salvar lançamento de obra" });
+  }
+});
+
+app.put("/financeiro/lancamentos-obra/:id", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    const id = String(req.params.id || "").trim();
+    if (!podeGerenciarFinanceiro(usuario)) return deny(res, "Sem permissão para editar custo de obra");
+    if (!isUuid(id)) return res.status(400).json({ ok: false, error: "ID inválido" });
+
+    const { data: antes } = await supabaseAdmin.from("financeiro_lancamentos_obra").select("*").eq("id", id).maybeSingle();
+    if (!antes) return res.status(404).json({ ok: false, error: "Lançamento não encontrado" });
+
+    const payload = normalizarLancamentoFinanceiroPayload(req.body, { exigeObra: true });
+    const podeAntes = await usuarioPodeAcessarObra(usuario, antes.obra_id);
+    const podeNovo = await usuarioPodeAcessarObra(usuario, payload.obra_id);
+    if (!podeAntes || !podeNovo) return deny(res, "Você não pode editar este lançamento");
+
+    const { data, error } = await supabaseAdmin.from("financeiro_lancamentos_obra").update(payload).eq("id", id).select("*").single();
+    if (error) throw error;
+    await registrarLog({ req, usuario, acao: "UPDATE", tabela: "financeiro_lancamentos_obra", registro_id: id, antes, depois: data, observacao: "Editou custo financeiro vinculado à obra" });
+    return res.json({ ok: true, data });
+  } catch (err) {
+    console.error("PUT /financeiro/lancamentos-obra/:id exception:", err);
+    return res.status(400).json({ ok: false, error: err.message || "Erro ao editar lançamento de obra" });
+  }
+});
+
+app.delete("/financeiro/lancamentos-obra/:id", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    const id = String(req.params.id || "").trim();
+    if (!isAdmin(usuario)) return deny(res, "Apenas administrador pode excluir lançamento");
+    if (!isUuid(id)) return res.status(400).json({ ok: false, error: "ID inválido" });
+
+    const { data: antes } = await supabaseAdmin.from("financeiro_lancamentos_obra").select("*").eq("id", id).maybeSingle();
+    const { error } = await supabaseAdmin.from("financeiro_lancamentos_obra").delete().eq("id", id);
+    if (error) throw error;
+    await registrarLog({ req, usuario, acao: "DELETE", tabela: "financeiro_lancamentos_obra", registro_id: id, antes, observacao: "Excluiu custo financeiro vinculado à obra" });
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("DELETE /financeiro/lancamentos-obra/:id exception:", err);
+    return res.status(400).json({ ok: false, error: err.message || "Erro ao excluir lançamento de obra" });
+  }
+});
+
+app.get("/financeiro/contas-empresa", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    if (!podeGerenciarFinanceiro(usuario)) return deny(res, "Sem permissão para acessar contas da empresa");
+
+    const fornecedor_id = String(req.query?.fornecedor_id || "").trim();
+    const status = String(req.query?.status || "").trim().toLowerCase();
+    const inicio = String(req.query?.inicio || "").trim();
+    const fim = String(req.query?.fim || "").trim();
+
+    let query = supabaseAdmin.from("financeiro_contas_empresa").select("*").order("data_lancamento", { ascending: false }).order("created_at", { ascending: false });
+    if (isUuid(fornecedor_id)) query = query.eq("fornecedor_id", fornecedor_id);
+    if (["pendente", "pago", "cancelado"].includes(status)) query = query.eq("status", status);
+    if (inicio) query = query.gte("data_lancamento", inicio);
+    if (fim) query = query.lte("data_lancamento", fim);
+
+    const { data, error } = await query;
+    if (error) throw error;
+    return res.json({ ok: true, data: data || [] });
+  } catch (err) {
+    console.error("GET /financeiro/contas-empresa exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro ao listar contas da empresa" });
+  }
+});
+
+app.post("/financeiro/contas-empresa", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    if (!podeGerenciarFinanceiro(usuario)) return deny(res, "Sem permissão para lançar conta da empresa");
+
+    const payload = normalizarLancamentoFinanceiroPayload(req.body);
+    const { data, error } = await supabaseAdmin.from("financeiro_contas_empresa").insert(payload).select("*").single();
+    if (error) throw error;
+    await registrarLog({ req, usuario, acao: "CREATE", tabela: "financeiro_contas_empresa", registro_id: data?.id, depois: data, observacao: "Lançou conta geral da empresa" });
+    return res.status(201).json({ ok: true, data });
+  } catch (err) {
+    console.error("POST /financeiro/contas-empresa exception:", err);
+    return res.status(400).json({ ok: false, error: err.message || "Erro ao salvar conta da empresa" });
+  }
+});
+
+app.put("/financeiro/contas-empresa/:id", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    const id = String(req.params.id || "").trim();
+    if (!podeGerenciarFinanceiro(usuario)) return deny(res, "Sem permissão para editar conta da empresa");
+    if (!isUuid(id)) return res.status(400).json({ ok: false, error: "ID inválido" });
+
+    const { data: antes } = await supabaseAdmin.from("financeiro_contas_empresa").select("*").eq("id", id).maybeSingle();
+    if (!antes) return res.status(404).json({ ok: false, error: "Conta não encontrada" });
+
+    const payload = normalizarLancamentoFinanceiroPayload(req.body);
+    const { data, error } = await supabaseAdmin.from("financeiro_contas_empresa").update(payload).eq("id", id).select("*").single();
+    if (error) throw error;
+    await registrarLog({ req, usuario, acao: "UPDATE", tabela: "financeiro_contas_empresa", registro_id: id, antes, depois: data, observacao: "Editou conta geral da empresa" });
+    return res.json({ ok: true, data });
+  } catch (err) {
+    console.error("PUT /financeiro/contas-empresa/:id exception:", err);
+    return res.status(400).json({ ok: false, error: err.message || "Erro ao editar conta da empresa" });
+  }
+});
+
+app.delete("/financeiro/contas-empresa/:id", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    const id = String(req.params.id || "").trim();
+    if (!isAdmin(usuario)) return deny(res, "Apenas administrador pode excluir conta da empresa");
+    if (!isUuid(id)) return res.status(400).json({ ok: false, error: "ID inválido" });
+
+    const { data: antes } = await supabaseAdmin.from("financeiro_contas_empresa").select("*").eq("id", id).maybeSingle();
+    const { error } = await supabaseAdmin.from("financeiro_contas_empresa").delete().eq("id", id);
+    if (error) throw error;
+    await registrarLog({ req, usuario, acao: "DELETE", tabela: "financeiro_contas_empresa", registro_id: id, antes, observacao: "Excluiu conta geral da empresa" });
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("DELETE /financeiro/contas-empresa/:id exception:", err);
+    return res.status(400).json({ ok: false, error: err.message || "Erro ao excluir conta da empresa" });
+  }
+});
+
 app.get("/funcionarios", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
