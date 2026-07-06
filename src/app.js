@@ -29,8 +29,6 @@ const limiter = rateLimit({
   },
 });
 
-app.use(limiter);
-
 const allowedOrigins = (process.env.CORS_ORIGIN || "")
   .split(",")
   .map((s) => s.trim())
@@ -41,6 +39,7 @@ app.use(
     origin: (origin, callback) => {
       if (!origin || origin === "null") return callback(null, true);
       if (allowedOrigins.length === 0) return callback(null, true);
+      if (allowedOrigins.includes("*")) return callback(null, true);
       if (allowedOrigins.includes(origin)) return callback(null, true);
 
       console.log("❌ CORS BLOQUEADO:", origin, "permitidos:", allowedOrigins);
@@ -52,6 +51,8 @@ app.use(
   }),
 );
 
+app.use(limiter);
+
 // ==================================================
 // HELPERS
 // ==================================================
@@ -61,18 +62,28 @@ app.use(
 // - outros usuários NÃO veem função "EQUIPE ENGENHARIA"
 // --------------------------------------------------
 
+function removerConteudoPerigoso(v) {
+  return String(v || "")
+    .replace(/<\s*script\b[^>]*>[\s\S]*?<\s*\/\s*script\s*>/gi, "")
+    .replace(/<\s*\/?\s*script\b[^>]*>/gi, "")
+    .replace(/\s+on[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "")
+    .replace(/\bjavascript\s*:/gi, "")
+    .replace(/\bdata\s*:\s*text\/html/gi, "")
+    .replace(/[<>]/g, "");
+}
+
 function limitarTexto(v, max) {
   if (v === undefined || v === null) return null;
 
-  let s = String(v).trim();
+  let s = removerConteudoPerigoso(v).trim();
 
   if (!s) return null;
 
   if (s.length > max) {
-    s = s.slice(0, max);
+    s = s.slice(0, max).trim();
   }
 
-  return s;
+  return s || null;
 }
 
 function isEquipeEngenharia(funcao) {
@@ -196,6 +207,10 @@ function isObraEquipeEngenharia(obra) {
   return nome === "EQUIPE ENGENHARIA";
 }
 
+function isObraAtiva(obra) {
+  return String(obra?.situacao || "ativo").trim().toLowerCase() === "ativo";
+}
+
 async function registrarLog({
   req,
   usuario = null,
@@ -281,6 +296,82 @@ function isConsulta(usuario) {
   return getNivel(usuario) === "consulta";
 }
 
+const COLUNA_PERMISSAO = {
+  ver: "pode_ver",
+  criar: "pode_criar",
+  editar: "pode_editar",
+  excluir: "pode_excluir",
+};
+
+function normalizarAcaoPermissao(acao) {
+  const a = String(acao || "")
+    .trim()
+    .toLowerCase();
+  return COLUNA_PERMISSAO[a] ? a : null;
+}
+
+async function temPermissao(usuario, modulo, acao) {
+  const acaoNormalizada = normalizarAcaoPermissao(acao);
+  const moduloCodigo = String(modulo || "")
+    .trim()
+    .toLowerCase();
+
+  if (!usuario?.id || !moduloCodigo || !acaoNormalizada) return false;
+
+  const coluna = COLUNA_PERMISSAO[acaoNormalizada];
+  const { data, error } = await supabaseAdmin
+    .from("permissoes_usuario")
+    .select(coluna)
+    .eq("usuario_id", usuario.id)
+    .eq("modulo_codigo", moduloCodigo)
+    .maybeSingle();
+
+  if (error) {
+    console.error("temPermissao error:", {
+      usuario_id: usuario.id,
+      modulo: moduloCodigo,
+      acao: acaoNormalizada,
+      error,
+    });
+    return false;
+  }
+
+  return data?.[coluna] === true;
+}
+
+async function temAlgumaPermissao(usuario, regras) {
+  for (const regra of regras || []) {
+    if (await temPermissao(usuario, regra.modulo, regra.acao)) return true;
+  }
+  return false;
+}
+
+async function exigirPermissao(res, usuario, modulo, acao, mensagem) {
+  if (await temPermissao(usuario, modulo, acao)) return true;
+  deny(
+    res,
+    mensagem ||
+      `Sem permissao para ${acao} em ${String(modulo || "este modulo")}`,
+  );
+  return false;
+}
+
+async function exigirAlgumaPermissao(res, usuario, regras, mensagem) {
+  if (await temAlgumaPermissao(usuario, regras)) return true;
+  deny(res, mensagem || "Sem permissao para esta acao");
+  return false;
+}
+
+async function listarPermissoesUsuario(usuarioId) {
+  const { data, error } = await supabaseAdmin
+    .from("permissoes_usuario")
+    .select("modulo_codigo, pode_ver, pode_criar, pode_editar, pode_excluir")
+    .eq("usuario_id", usuarioId);
+
+  if (error) throw error;
+  return data || [];
+}
+
 // --------------------------------------------------
 // NOVA REGRA DE ACESSO À OBRA
 // - admin: acessa tudo
@@ -294,13 +385,8 @@ async function usuarioPodeAcessarObra(usuario, obraId) {
   if (!obra) return false;
 
   if (isAdmin(usuario)) return true;
-
   if (isObraEquipeEngenharia(obra)) return false;
-
-  if (isEncarregado(usuario)) return true;
-  if (isFinanceiro(usuario)) return true;
-
-  return false;
+  return true;
 }
 
 async function filtrarObrasVisiveis(usuario, obras) {
@@ -524,10 +610,170 @@ app.get("/me", requireAuth, async (req, res) => {
       observacao: "Usuário consultou o próprio perfil (/me)",
     });
 
-    return res.json({ ok: true, data });
+    const permissoes = await listarPermissoesUsuario(data.id);
+
+    return res.json({ ok: true, data: { ...data, permissoes } });
   } catch (err) {
     console.error("GET /me exception:", err);
     return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
+// ==================================================
+// CONFIGURACOES / PERMISSOES
+// Acesso fixo: somente nivel_acesso = admin.
+// Este modulo nao depende da tabela permissoes_usuario.
+// ==================================================
+function exigirAdminConfiguracoes(res, usuario) {
+  if (isAdmin(usuario)) return true;
+  deny(res, "Apenas administrador pode acessar configuracoes");
+  return false;
+}
+
+app.get("/permissoes/modulos", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    if (!exigirAdminConfiguracoes(res, usuario)) return;
+
+    const { data, error } = await supabaseAdmin
+      .from("modulos_sistema")
+      .select("*")
+      .eq("ativo", true)
+      .order("ordem", { ascending: true });
+
+    if (error) throw error;
+    return res.json({ ok: true, data: data || [] });
+  } catch (err) {
+    console.error("GET /permissoes/modulos exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro ao listar modulos" });
+  }
+});
+
+app.get("/permissoes/usuarios", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    if (!exigirAdminConfiguracoes(res, usuario)) return;
+
+    const { data, error } = await supabaseAdmin
+      .from("cadastro_user")
+      .select("id, nome, email, nivel_acesso, situacao")
+      .order("nome", { ascending: true });
+
+    if (error) throw error;
+    return res.json({ ok: true, data: data || [] });
+  } catch (err) {
+    console.error("GET /permissoes/usuarios exception:", err);
+    return res
+      .status(500)
+      .json({ ok: false, error: "Erro ao listar usuarios" });
+  }
+});
+
+app.get("/permissoes/usuarios/:id", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    if (!exigirAdminConfiguracoes(res, usuario)) return;
+
+    const id = String(req.params.id || "").trim();
+    if (!isUuid(id))
+      return res.status(400).json({ ok: false, error: "ID invalido" });
+
+    const alvo = await getUsuarioById(id);
+    if (!alvo)
+      return res.status(404).json({ ok: false, error: "Usuario nao encontrado" });
+
+    const permissoes = await listarPermissoesUsuario(id);
+    return res.json({ ok: true, data: { usuario: alvo, permissoes } });
+  } catch (err) {
+    console.error("GET /permissoes/usuarios/:id exception:", err);
+    return res
+      .status(500)
+      .json({ ok: false, error: "Erro ao listar permissoes" });
+  }
+});
+
+app.put("/permissoes/usuarios/:id", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    if (!exigirAdminConfiguracoes(res, usuario)) return;
+
+    const id = String(req.params.id || "").trim();
+    if (!isUuid(id))
+      return res.status(400).json({ ok: false, error: "ID invalido" });
+
+    if (id === usuario.id) {
+      return deny(res, "Administrador nao pode alterar as proprias permissoes");
+    }
+
+    const alvo = await getUsuarioById(id);
+    if (!alvo)
+      return res.status(404).json({ ok: false, error: "Usuario nao encontrado" });
+
+    const permissoes = Array.isArray(req.body?.permissoes)
+      ? req.body.permissoes
+      : [];
+
+    const { data: modulos, error: modErr } = await supabaseAdmin
+      .from("modulos_sistema")
+      .select("codigo, permite_ver, permite_criar, permite_editar, permite_excluir")
+      .eq("ativo", true);
+
+    if (modErr) throw modErr;
+    const mapaModulos = new Map((modulos || []).map((m) => [m.codigo, m]));
+
+    const antes = await listarPermissoesUsuario(id);
+    const linhas = [];
+
+    for (const item of permissoes) {
+      const modulo = String(item?.modulo_codigo || item?.modulo || "")
+        .trim()
+        .toLowerCase();
+      if (!mapaModulos.has(modulo)) continue;
+
+      const meta = mapaModulos.get(modulo);
+      linhas.push({
+        usuario_id: id,
+        modulo_codigo: modulo,
+        pode_ver: meta.permite_ver ? item?.pode_ver === true : false,
+        pode_criar: meta.permite_criar ? item?.pode_criar === true : false,
+        pode_editar: meta.permite_editar ? item?.pode_editar === true : false,
+        pode_excluir: meta.permite_excluir ? item?.pode_excluir === true : false,
+        updated_by: usuario.id,
+      });
+    }
+
+    const { error: delErr } = await supabaseAdmin
+      .from("permissoes_usuario")
+      .delete()
+      .eq("usuario_id", id);
+    if (delErr) throw delErr;
+
+    if (linhas.length) {
+      const { error: insErr } = await supabaseAdmin
+        .from("permissoes_usuario")
+        .insert(linhas);
+      if (insErr) throw insErr;
+    }
+
+    const depois = await listarPermissoesUsuario(id);
+
+    await registrarLog({
+      req,
+      usuario,
+      acao: "UPDATE",
+      tabela: "permissoes_usuario",
+      registro_id: id,
+      antes,
+      depois,
+      observacao: `Atualizou permissoes do usuario ${alvo.email || alvo.nome}`,
+    });
+
+    return res.json({ ok: true, data: depois });
+  } catch (err) {
+    console.error("PUT /permissoes/usuarios/:id exception:", err);
+    return res
+      .status(500)
+      .json({ ok: false, error: "Erro ao salvar permissoes" });
   }
 });
 
@@ -538,7 +784,20 @@ app.get("/usuarios/responsaveis", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
 
-    if (!(isAdmin(usuario) || isFinanceiro(usuario))) {
+    if (
+      !(await exigirAlgumaPermissao(
+        res,
+        usuario,
+        [
+          { modulo: "cad_obras", acao: "criar" },
+          { modulo: "editar_obra", acao: "editar" },
+        ],
+        "Sem permissao para listar responsaveis",
+      ))
+    )
+      return;
+
+    if (false && !(isAdmin(usuario) || isFinanceiro(usuario))) {
       return deny(
         res,
         "Apenas administrador ou financeiro pode listar responsáveis",
@@ -583,7 +842,23 @@ app.get("/usuarios", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
 
-    if (!isAdmin(usuario)) {
+    if (
+      !(await exigirAlgumaPermissao(
+        res,
+        usuario,
+        [
+          { modulo: "cad_encarregados", acao: "ver" },
+          { modulo: "editar_usuario", acao: "ver" },
+          { modulo: "cad_editar_excluir", acao: "ver" },
+          { modulo: "cad_obras", acao: "criar" },
+          { modulo: "editar_obra", acao: "editar" },
+        ],
+        "Sem permissao para listar usuarios",
+      ))
+    )
+      return;
+
+    if (false && !isAdmin(usuario)) {
       return deny(res, "Apenas administrador pode listar usuários");
     }
 
@@ -620,7 +895,20 @@ app.get("/usuarios/:id", requireAuth, async (req, res) => {
     const usuario = await getUsuarioLogado(req.authUser.id);
     const id = req.params.id;
 
-    if (!isAdmin(usuario)) {
+    if (
+      !(await exigirAlgumaPermissao(
+        res,
+        usuario,
+        [
+          { modulo: "editar_usuario", acao: "ver" },
+          { modulo: "cad_editar_excluir", acao: "ver" },
+        ],
+        "Sem permissao para consultar usuario",
+      ))
+    )
+      return;
+
+    if (false && !isAdmin(usuario)) {
       return deny(res, "Apenas administrador pode consultar usuário");
     }
 
@@ -658,17 +946,25 @@ app.post("/usuarios", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
 
-    if (!isAdmin(usuario)) {
+    if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "cad_encarregados",
+        "criar",
+        "Sem permissao para criar usuarios",
+      ))
+    )
+      return;
+
+    if (false && !isAdmin(usuario)) {
       return deny(res, "Apenas administrador pode criar usuários");
     }
 
     const nome = limitarTexto(req.body?.nome, 120);
     const email = limitarTexto(req.body?.email, 160);
     const senha = limitarTexto(req.body?.senha, 120);
-    const nivel_acesso = limitarTexto(
-      req.body?.nivel_acesso || "encarregado",
-      30,
-    );
+    const nivel_acesso = "consulta";
     const observacao = limitarTexto(req.body?.observacao, 1000);
     const situacao = normSituacao(req.body?.situacao, "ativo");
 
@@ -758,7 +1054,18 @@ app.patch("/usuarios/:id", requireAuth, async (req, res) => {
     const usuario = await getUsuarioLogado(req.authUser.id);
     const id = req.params.id;
 
-    if (!isAdmin(usuario)) {
+    if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "editar_usuario",
+        "editar",
+        "Sem permissao para editar usuarios",
+      ))
+    )
+      return;
+
+    if (false && !isAdmin(usuario)) {
       return deny(res, "Apenas administrador pode editar usuários");
     }
 
@@ -767,9 +1074,6 @@ app.patch("/usuarios/:id", requireAuth, async (req, res) => {
     const patch = {
       ...(req.body?.nome !== undefined
         ? { nome: String(req.body.nome).trim() }
-        : {}),
-      ...(req.body?.nivel_acesso !== undefined
-        ? { nivel_acesso: String(req.body.nivel_acesso).trim() }
         : {}),
       ...(req.body?.situacao !== undefined
         ? { situacao: normSituacao(req.body.situacao) }
@@ -861,7 +1165,18 @@ app.delete("/usuarios/:id", requireAuth, async (req, res) => {
     const usuario = await getUsuarioLogado(req.authUser.id);
     const id = req.params.id;
 
-    if (!isAdmin(usuario)) {
+    if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "editar_usuario",
+        "excluir",
+        "Sem permissao para excluir usuarios",
+      ))
+    )
+      return;
+
+    if (false && !isAdmin(usuario)) {
       return deny(res, "Apenas administrador pode excluir usuários");
     }
 
@@ -920,6 +1235,18 @@ app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
     const usuario = await getUsuarioLogado(req.authUser.id);
 
     if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "rel_pagamento",
+        "ver",
+        "Sem permissao para acessar relatorio de pagamento",
+      ))
+    )
+      return;
+
+    if (
+      false &&
       !(isAdmin(usuario) || isFinanceiro(usuario) || isEncarregado(usuario))
     ) {
       return deny(
@@ -1179,7 +1506,22 @@ function normalizarLancamentoFinanceiroPayload(
 app.get("/financeiro/fornecedores", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
-    if (!podeGerenciarFinanceiro(usuario))
+    if (
+      !(await exigirAlgumaPermissao(
+        res,
+        usuario,
+        [
+          { modulo: "financeiro_fornecedores", acao: "ver" },
+          { modulo: "financeiro_lanc_obra", acao: "ver" },
+          { modulo: "financeiro_lanc_obra", acao: "criar" },
+          { modulo: "financeiro_contas_empresa", acao: "ver" },
+          { modulo: "financeiro_contas_empresa", acao: "criar" },
+        ],
+        "Sem permissao para acessar fornecedores",
+      ))
+    )
+      return;
+    if (false && !podeGerenciarFinanceiro(usuario))
       return deny(res, "Sem permissão para acessar fornecedores");
 
     const situacao = String(req.query?.situacao || "")
@@ -1206,7 +1548,17 @@ app.get("/financeiro/fornecedores", requireAuth, async (req, res) => {
 app.post("/financeiro/fornecedores", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
-    if (!podeGerenciarFinanceiro(usuario))
+    if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "financeiro_fornecedores",
+        "criar",
+        "Sem permissao para cadastrar fornecedor",
+      ))
+    )
+      return;
+    if (false && !podeGerenciarFinanceiro(usuario))
       return deny(res, "Sem permissão para cadastrar fornecedor");
 
     const payload = normalizarFornecedorPayload(req.body);
@@ -1238,7 +1590,17 @@ app.put("/financeiro/fornecedores/:id", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
     const id = String(req.params.id || "").trim();
-    if (!podeGerenciarFinanceiro(usuario))
+    if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "financeiro_fornecedores",
+        "editar",
+        "Sem permissao para editar fornecedor",
+      ))
+    )
+      return;
+    if (false && !podeGerenciarFinanceiro(usuario))
       return deny(res, "Sem permissão para editar fornecedor");
     if (!isUuid(id))
       return res.status(400).json({ ok: false, error: "ID inválido" });
@@ -1279,7 +1641,17 @@ app.delete("/financeiro/fornecedores/:id", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
     const id = String(req.params.id || "").trim();
-    if (!isAdmin(usuario))
+    if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "financeiro_fornecedores",
+        "excluir",
+        "Sem permissao para excluir fornecedor",
+      ))
+    )
+      return;
+    if (false && !isAdmin(usuario))
       return deny(res, "Apenas administrador pode excluir fornecedor");
     if (!isUuid(id))
       return res.status(400).json({ ok: false, error: "ID inválido" });
@@ -1348,7 +1720,17 @@ async function montarQueryLancamentosObra(usuario, req) {
 app.get("/financeiro/lancamentos-obra", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
-    if (!podeGerenciarFinanceiro(usuario))
+    if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "financeiro_lanc_obra",
+        "ver",
+        "Sem permissao para acessar lancamentos de obra",
+      ))
+    )
+      return;
+    if (false && !podeGerenciarFinanceiro(usuario))
       return deny(res, "Sem permissão para acessar lançamentos de obra");
 
     const montado = await montarQueryLancamentosObra(usuario, req);
@@ -1369,7 +1751,17 @@ app.get("/financeiro/lancamentos-obra", requireAuth, async (req, res) => {
 app.post("/financeiro/lancamentos-obra", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
-    if (!podeGerenciarFinanceiro(usuario))
+    if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "financeiro_lanc_obra",
+        "criar",
+        "Sem permissao para lancar custo de obra",
+      ))
+    )
+      return;
+    if (false && !podeGerenciarFinanceiro(usuario))
       return deny(res, "Sem permissão para lançar custo de obra");
 
     const payload = normalizarLancamentoFinanceiroPayload(req.body, {
@@ -1409,7 +1801,17 @@ app.put("/financeiro/lancamentos-obra/:id", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
     const id = String(req.params.id || "").trim();
-    if (!podeGerenciarFinanceiro(usuario))
+    if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "financeiro_lanc_obra",
+        "editar",
+        "Sem permissao para editar custo de obra",
+      ))
+    )
+      return;
+    if (false && !podeGerenciarFinanceiro(usuario))
       return deny(res, "Sem permissão para editar custo de obra");
     if (!isUuid(id))
       return res.status(400).json({ ok: false, error: "ID inválido" });
@@ -1468,7 +1870,17 @@ app.delete(
     try {
       const usuario = await getUsuarioLogado(req.authUser.id);
       const id = String(req.params.id || "").trim();
-      if (!isAdmin(usuario))
+      if (
+        !(await exigirPermissao(
+          res,
+          usuario,
+          "financeiro_lanc_obra",
+          "excluir",
+          "Sem permissao para excluir lancamento de obra",
+        ))
+      )
+        return;
+      if (false && !isAdmin(usuario))
         return deny(res, "Apenas administrador pode excluir lançamento");
       if (!isUuid(id))
         return res.status(400).json({ ok: false, error: "ID inválido" });
@@ -1508,7 +1920,17 @@ app.delete(
 app.get("/financeiro/contas-empresa", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
-    if (!podeGerenciarFinanceiro(usuario))
+    if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "financeiro_contas_empresa",
+        "ver",
+        "Sem permissao para acessar contas da empresa",
+      ))
+    )
+      return;
+    if (false && !podeGerenciarFinanceiro(usuario))
       return deny(res, "Sem permissão para acessar contas da empresa");
 
     const fornecedor_id = String(req.query?.fornecedor_id || "").trim();
@@ -1543,7 +1965,17 @@ app.get("/financeiro/contas-empresa", requireAuth, async (req, res) => {
 app.post("/financeiro/contas-empresa", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
-    if (!podeGerenciarFinanceiro(usuario))
+    if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "financeiro_contas_empresa",
+        "criar",
+        "Sem permissao para lancar conta da empresa",
+      ))
+    )
+      return;
+    if (false && !podeGerenciarFinanceiro(usuario))
       return deny(res, "Sem permissão para lançar conta da empresa");
 
     const payload = normalizarLancamentoFinanceiroPayload(req.body);
@@ -1578,7 +2010,17 @@ app.put("/financeiro/contas-empresa/:id", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
     const id = String(req.params.id || "").trim();
-    if (!podeGerenciarFinanceiro(usuario))
+    if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "financeiro_contas_empresa",
+        "editar",
+        "Sem permissao para editar conta da empresa",
+      ))
+    )
+      return;
+    if (false && !podeGerenciarFinanceiro(usuario))
       return deny(res, "Sem permissão para editar conta da empresa");
     if (!isUuid(id))
       return res.status(400).json({ ok: false, error: "ID inválido" });
@@ -1625,7 +2067,17 @@ app.delete("/financeiro/contas-empresa/:id", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
     const id = String(req.params.id || "").trim();
-    if (!isAdmin(usuario))
+    if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "financeiro_contas_empresa",
+        "excluir",
+        "Sem permissao para excluir conta da empresa",
+      ))
+    )
+      return;
+    if (false && !isAdmin(usuario))
       return deny(res, "Apenas administrador pode excluir conta da empresa");
     if (!isUuid(id))
       return res.status(400).json({ ok: false, error: "ID inválido" });
@@ -1664,6 +2116,25 @@ app.delete("/financeiro/contas-empresa/:id", requireAuth, async (req, res) => {
 app.get("/funcionarios", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
+
+    if (
+      !(await exigirAlgumaPermissao(
+        res,
+        usuario,
+        [
+          { modulo: "cad_funcionarios", acao: "ver" },
+          { modulo: "editar_funcionario", acao: "ver" },
+          { modulo: "consult_funcionarios", acao: "ver" },
+          { modulo: "consulta", acao: "ver" },
+          { modulo: "diarias", acao: "ver" },
+          { modulo: "empreita", acao: "ver" },
+          { modulo: "adiantamento", acao: "ver" },
+          { modulo: "cad_vinc_empreiteiro", acao: "ver" },
+        ],
+        "Sem permissao para listar funcionarios",
+      ))
+    )
+      return;
 
     const { data, error } = await supabaseAdmin
       .from("cadastro_func")
@@ -1704,6 +2175,20 @@ app.get("/funcionarios/:id", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
     const id = req.params.id;
+
+    if (
+      !(await exigirAlgumaPermissao(
+        res,
+        usuario,
+        [
+          { modulo: "editar_funcionario", acao: "ver" },
+          { modulo: "consult_funcionarios", acao: "ver" },
+          { modulo: "cad_editar_excluir", acao: "ver" },
+        ],
+        "Sem permissao para consultar funcionario",
+      ))
+    )
+      return;
 
     if (!isUuid(id)) {
       return res.status(400).json({ ok: false, error: "ID inválido" });
@@ -1750,6 +2235,18 @@ app.post("/funcionarios", requireAuth, async (req, res) => {
     const usuario = await getUsuarioLogado(req.authUser.id);
 
     if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "cad_funcionarios",
+        "criar",
+        "Sem permissao para cadastrar funcionario",
+      ))
+    )
+      return;
+
+    if (
+      false &&
       !(isAdmin(usuario) || isFinanceiro(usuario) || isEncarregado(usuario))
     ) {
       return deny(
@@ -1838,6 +2335,18 @@ app.put("/funcionarios/:id", requireAuth, async (req, res) => {
     const usuario = await getUsuarioLogado(req.authUser.id);
 
     if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "editar_funcionario",
+        "editar",
+        "Sem permissao para editar funcionario",
+      ))
+    )
+      return;
+
+    if (
+      false &&
       !(isAdmin(usuario) || isFinanceiro(usuario) || isEncarregado(usuario))
     ) {
       return deny(
@@ -1923,6 +2432,18 @@ app.patch("/funcionarios/:id", requireAuth, async (req, res) => {
     const usuario = await getUsuarioLogado(req.authUser.id);
 
     if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "editar_funcionario",
+        "editar",
+        "Sem permissao para editar funcionario",
+      ))
+    )
+      return;
+
+    if (
+      false &&
       !(isAdmin(usuario) || isFinanceiro(usuario) || isEncarregado(usuario))
     ) {
       return deny(
@@ -2034,6 +2555,18 @@ app.delete("/funcionarios/:id", requireAuth, async (req, res) => {
     const usuario = await getUsuarioLogado(req.authUser.id);
 
     if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "editar_funcionario",
+        "excluir",
+        "Sem permissao para excluir funcionario",
+      ))
+    )
+      return;
+
+    if (
+      false &&
       !(isAdmin(usuario) || isFinanceiro(usuario) || isEncarregado(usuario))
     ) {
       return deny(
@@ -2090,11 +2623,22 @@ app.get("/equipe-obra", requireAuth, async (req, res) => {
       });
     }
 
-    if (isConsulta(usuario)) {
+    if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "equipe_obra",
+        "ver",
+        "Sem permissao para acessar equipe por obra",
+      ))
+    )
+      return;
+
+    if (false && isConsulta(usuario)) {
       return deny(res, "Usuário somente consulta não acessa equipe por obra");
     }
 
-    if (!(isAdmin(usuario) || isEncarregado(usuario))) {
+    if (false && !(isAdmin(usuario) || isEncarregado(usuario))) {
       return deny(
         res,
         "Apenas administrador ou encarregado acessa equipe por obra",
@@ -2141,14 +2685,25 @@ app.post("/equipe-obra", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
 
-    if (isConsulta(usuario)) {
+    if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "equipe_obra",
+        "criar",
+        "Sem permissao para alterar equipe por obra",
+      ))
+    )
+      return;
+
+    if (false && isConsulta(usuario)) {
       return deny(
         res,
         "Usuário somente consulta não pode alterar equipe por obra",
       );
     }
 
-    if (!(isAdmin(usuario) || isEncarregado(usuario))) {
+    if (false && !(isAdmin(usuario) || isEncarregado(usuario))) {
       return deny(
         res,
         "Apenas administrador ou encarregado pode alterar equipe por obra",
@@ -2267,14 +2822,25 @@ app.delete("/equipe-obra/:id", requireAuth, async (req, res) => {
       return res.status(400).json({ ok: false, error: "id inválido (UUID)" });
     }
 
-    if (isConsulta(usuario)) {
+    if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "equipe_obra",
+        "excluir",
+        "Sem permissao para remover equipe por obra",
+      ))
+    )
+      return;
+
+    if (false && isConsulta(usuario)) {
       return deny(
         res,
         "Usuário somente consulta não pode remover equipe por obra",
       );
     }
 
-    if (!(isAdmin(usuario) || isEncarregado(usuario))) {
+    if (false && !(isAdmin(usuario) || isEncarregado(usuario))) {
       return deny(
         res,
         "Apenas administrador ou encarregado pode remover equipe por obra",
@@ -2332,6 +2898,20 @@ app.get("/empreiteiros", requireAuth, async (req, res) => {
     const usuario = await getUsuarioLogado(req.authUser.id);
 
     if (
+      !(await exigirAlgumaPermissao(
+        res,
+        usuario,
+        [
+          { modulo: "cad_vinc_empreiteiro", acao: "ver" },
+          { modulo: "rel_empreiteiro", acao: "ver" },
+        ],
+        "Sem permissao para listar empreiteiros",
+      ))
+    )
+      return;
+
+    if (
+      false &&
       !(isAdmin(usuario) || isFinanceiro(usuario) || isEncarregado(usuario))
     ) {
       return deny(
@@ -2375,6 +2955,18 @@ app.get("/empreiteiros/:id", requireAuth, async (req, res) => {
     const id = String(req.params.id || "").trim();
 
     if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "cad_vinc_empreiteiro",
+        "ver",
+        "Sem permissao para consultar empreiteiro",
+      ))
+    )
+      return;
+
+    if (
+      false &&
       !(isAdmin(usuario) || isFinanceiro(usuario) || isEncarregado(usuario))
     ) {
       return deny(
@@ -2417,6 +3009,18 @@ app.post("/empreiteiros", requireAuth, async (req, res) => {
     const usuario = await getUsuarioLogado(req.authUser.id);
 
     if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "cad_vinc_empreiteiro",
+        "criar",
+        "Sem permissao para cadastrar empreiteiro",
+      ))
+    )
+      return;
+
+    if (
+      false &&
       !(isAdmin(usuario) || isFinanceiro(usuario) || isEncarregado(usuario))
     ) {
       return deny(
@@ -2529,6 +3133,18 @@ app.put("/empreiteiros/:id", requireAuth, async (req, res) => {
     const id = String(req.params.id || "").trim();
 
     if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "cad_vinc_empreiteiro",
+        "editar",
+        "Sem permissao para atualizar empreiteiro",
+      ))
+    )
+      return;
+
+    if (
+      false &&
       !(isAdmin(usuario) || isFinanceiro(usuario) || isEncarregado(usuario))
     ) {
       return deny(
@@ -2696,7 +3312,18 @@ app.get("/lanc-diarias", requireAuth, async (req, res) => {
       });
     }
 
-    if (!(isAdmin(usuario) || isEncarregado(usuario))) {
+    if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "diarias",
+        "ver",
+        "Sem permissao para acessar diarias",
+      ))
+    )
+      return;
+
+    if (false && !(isAdmin(usuario) || isEncarregado(usuario))) {
       return deny(
         res,
         "Apenas administrador ou encarregado pode acessar diárias",
@@ -2742,7 +3369,18 @@ app.post("/lanc-diarias", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
 
-    if (!(isAdmin(usuario) || isEncarregado(usuario))) {
+    if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "diarias",
+        "criar",
+        "Sem permissao para lancar diarias",
+      ))
+    )
+      return;
+
+    if (false && !(isAdmin(usuario) || isEncarregado(usuario))) {
       return deny(
         res,
         "Apenas administrador ou encarregado pode lançar diárias",
@@ -2984,7 +3622,18 @@ app.get("/diarias-ajustes", requireAuth, async (req, res) => {
       });
     }
 
-    if (!(isAdmin(usuario) || isEncarregado(usuario))) {
+    if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "diarias",
+        "ver",
+        "Sem permissao para acessar ajustes de diarias",
+      ))
+    )
+      return;
+
+    if (false && !(isAdmin(usuario) || isEncarregado(usuario))) {
       return deny(
         res,
         "Apenas administrador ou encarregado pode acessar ajustes de diárias",
@@ -3031,7 +3680,20 @@ app.post("/diarias-ajustes", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
 
-    if (!(isAdmin(usuario) || isEncarregado(usuario))) {
+    if (
+      !(await exigirAlgumaPermissao(
+        res,
+        usuario,
+        [
+          { modulo: "diarias", acao: "criar" },
+          { modulo: "diarias", acao: "editar" },
+        ],
+        "Sem permissao para salvar ajustes de diarias",
+      ))
+    )
+      return;
+
+    if (false && !(isAdmin(usuario) || isEncarregado(usuario))) {
       return deny(
         res,
         "Apenas administrador ou encarregado pode salvar ajustes de diárias",
@@ -3269,7 +3931,19 @@ async function upsertAdiantamentoLancamento(payload) {
 app.get("/adiantamentos", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
-    if (!podeGerenciarAdiantamento(usuario)) {
+    if (
+      !(await exigirAlgumaPermissao(
+        res,
+        usuario,
+        [
+          { modulo: "adiantamento", acao: "ver" },
+          { modulo: "editar_adiantamento", acao: "ver" },
+        ],
+        "Sem permissao para listar adiantamentos",
+      ))
+    )
+      return;
+    if (false && !podeGerenciarAdiantamento(usuario)) {
       return deny(res, "Sem permissão para listar adiantamentos");
     }
 
@@ -3361,7 +4035,17 @@ app.get("/adiantamentos", requireAuth, async (req, res) => {
 app.post("/adiantamentos", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
-    if (!podeGerenciarAdiantamento(usuario)) {
+    if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "adiantamento",
+        "criar",
+        "Sem permissao para lancar adiantamento",
+      ))
+    )
+      return;
+    if (false && !podeGerenciarAdiantamento(usuario)) {
       return deny(res, "Sem permissão para lançar adiantamento");
     }
 
@@ -3394,7 +4078,17 @@ app.post("/adiantamentos", requireAuth, async (req, res) => {
 app.put("/adiantamentos", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
-    if (!podeGerenciarAdiantamento(usuario)) {
+    if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "editar_adiantamento",
+        "editar",
+        "Sem permissao para editar adiantamento",
+      ))
+    )
+      return;
+    if (false && !podeGerenciarAdiantamento(usuario)) {
       return deny(res, "Sem permissão para editar adiantamento");
     }
 
@@ -3475,7 +4169,17 @@ app.put("/adiantamentos", requireAuth, async (req, res) => {
 app.delete("/adiantamentos", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
-    if (!podeGerenciarAdiantamento(usuario)) {
+    if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "editar_adiantamento",
+        "excluir",
+        "Sem permissao para excluir adiantamento",
+      ))
+    )
+      return;
+    if (false && !podeGerenciarAdiantamento(usuario)) {
       return deny(res, "Sem permissão para excluir adiantamento");
     }
 
@@ -3554,11 +4258,26 @@ app.get("/funcionarios-vinculados", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
 
-    if (isConsulta(usuario)) {
+    if (
+      !(await exigirAlgumaPermissao(
+        res,
+        usuario,
+        [
+          { modulo: "diarias", acao: "ver" },
+          { modulo: "empreita", acao: "ver" },
+          { modulo: "adiantamento", acao: "ver" },
+          { modulo: "equipe_obra", acao: "ver" },
+        ],
+        "Sem permissao para acessar vinculos por obra",
+      ))
+    )
+      return;
+
+    if (false && isConsulta(usuario)) {
       return deny(res, "Usuário somente consulta não acessa vínculos por obra");
     }
 
-    if (!(isAdmin(usuario) || isEncarregado(usuario))) {
+    if (false && !(isAdmin(usuario) || isEncarregado(usuario))) {
       return deny(
         res,
         "Apenas administrador ou encarregado pode acessar vínculos por obra",
@@ -3621,7 +4340,22 @@ app.get("/equipe-obra/todas", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
 
-    if (!(isAdmin(usuario) || isFinanceiro(usuario))) {
+    if (
+      !(await exigirAlgumaPermissao(
+        res,
+        usuario,
+        [
+          { modulo: "rel_obras", acao: "ver" },
+          { modulo: "rel_pagamento", acao: "ver" },
+          { modulo: "rel_funcionarios", acao: "ver" },
+          { modulo: "equipe_obra", acao: "ver" },
+        ],
+        "Sem permissao para ver todas as equipes",
+      ))
+    )
+      return;
+
+    if (false && !(isAdmin(usuario) || isFinanceiro(usuario))) {
       return deny(
         res,
         "Apenas administrador ou financeiro pode ver todas as equipes",
@@ -3677,7 +4411,18 @@ app.get("/empreitas", requireAuth, async (req, res) => {
     const usuario = await getUsuarioLogado(req.authUser.id);
     const { inicio, fim, obra_id, funcionario_id } = req.query;
 
-    if (!(isAdmin(usuario) || isEncarregado(usuario))) {
+    if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "empreita",
+        "ver",
+        "Sem permissao para acessar empreitas",
+      ))
+    )
+      return;
+
+    if (false && !(isAdmin(usuario) || isEncarregado(usuario))) {
       return deny(
         res,
         "Apenas administrador ou encarregado pode acessar empreitas",
@@ -3763,7 +4508,18 @@ app.get("/empreitas/:id", requireAuth, async (req, res) => {
     const usuario = await getUsuarioLogado(req.authUser.id);
     const id = req.params.id;
 
-    if (!(isAdmin(usuario) || isEncarregado(usuario))) {
+    if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "empreita",
+        "ver",
+        "Sem permissao para consultar empreita",
+      ))
+    )
+      return;
+
+    if (false && !(isAdmin(usuario) || isEncarregado(usuario))) {
       return deny(
         res,
         "Apenas administrador ou encarregado pode consultar empreita",
@@ -3809,7 +4565,18 @@ app.post("/empreitas", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
 
-    if (!(isAdmin(usuario) || isEncarregado(usuario))) {
+    if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "empreita",
+        "criar",
+        "Sem permissao para lancar empreita",
+      ))
+    )
+      return;
+
+    if (false && !(isAdmin(usuario) || isEncarregado(usuario))) {
       return deny(
         res,
         "Apenas administrador ou encarregado pode lançar empreita",
@@ -3826,6 +4593,17 @@ app.post("/empreitas", requireAuth, async (req, res) => {
       return res
         .status(400)
         .json({ ok: false, error: "obra_id é obrigatório (UUID)" });
+    }
+
+    const obra = await getObraById(obra_id);
+    if (!obra) {
+      return res.status(404).json({ ok: false, error: "Obra nao encontrada" });
+    }
+    if (!isObraAtiva(obra)) {
+      return res.status(400).json({
+        ok: false,
+        error: "Nao e permitido lancar empreita em obra inativa",
+      });
     }
 
     const pode = await usuarioPodeAcessarObra(usuario, obra_id);
@@ -3901,7 +4679,18 @@ app.put("/empreitas/:id", requireAuth, async (req, res) => {
       return res.status(400).json({ ok: false, error: "id inválido (UUID)" });
     }
 
-    if (!(isAdmin(usuario) || isEncarregado(usuario))) {
+    if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "empreita",
+        "editar",
+        "Sem permissao para editar empreita",
+      ))
+    )
+      return;
+
+    if (false && !(isAdmin(usuario) || isEncarregado(usuario))) {
       return deny(
         res,
         "Apenas administrador ou encarregado pode editar empreita",
@@ -3949,6 +4738,17 @@ app.put("/empreitas/:id", requireAuth, async (req, res) => {
       return res.status(400).json({
         ok: false,
         error: "valor inválido",
+      });
+    }
+
+    const novaObra = await getObraById(obra_id);
+    if (!novaObra) {
+      return res.status(404).json({ ok: false, error: "Obra nao encontrada" });
+    }
+    if (!isObraAtiva(novaObra)) {
+      return res.status(400).json({
+        ok: false,
+        error: "Nao e permitido salvar empreita em obra inativa",
       });
     }
 
@@ -4006,7 +4806,18 @@ app.delete("/empreitas/:id", requireAuth, async (req, res) => {
       return res.status(400).json({ ok: false, error: "id inválido (UUID)" });
     }
 
-    if (!(isAdmin(usuario) || isEncarregado(usuario))) {
+    if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "empreita",
+        "excluir",
+        "Sem permissao para excluir empreita",
+      ))
+    )
+      return;
+
+    if (false && !(isAdmin(usuario) || isEncarregado(usuario))) {
       return deny(
         res,
         "Apenas administrador ou encarregado pode excluir empreita",
@@ -4062,11 +4873,32 @@ app.get("/obras", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
 
-    if (isConsulta(usuario)) {
+    if (
+      !(await exigirAlgumaPermissao(
+        res,
+        usuario,
+        [
+          { modulo: "cad_obras", acao: "ver" },
+          { modulo: "editar_obra", acao: "ver" },
+          { modulo: "consult_obras", acao: "ver" },
+          { modulo: "consulta", acao: "ver" },
+          { modulo: "diarias", acao: "ver" },
+          { modulo: "empreita", acao: "ver" },
+          { modulo: "adiantamento", acao: "ver" },
+          { modulo: "financeiro_lanc_obra", acao: "ver" },
+          { modulo: "financeiro_lanc_obra", acao: "criar" },
+          { modulo: "equipe_obra", acao: "ver" },
+        ],
+        "Sem permissao para acessar obras",
+      ))
+    )
+      return;
+
+    if (false && isConsulta(usuario)) {
       return deny(res, "Usuário somente consulta não acessa obras");
     }
 
-    if (!(isAdmin(usuario) || isEncarregado(usuario))) {
+    if (false && !(isAdmin(usuario) || isEncarregado(usuario))) {
       return deny(
         res,
         "Apenas administrador ou encarregado pode acessar obras",
@@ -4108,11 +4940,32 @@ app.get("/obras/todas", requireAuth, async (req, res) => {
     const usuario = await getUsuarioLogado(req.authUser.id);
 
     if (
+      !(await exigirAlgumaPermissao(
+        res,
+        usuario,
+        [
+          { modulo: "cad_obras", acao: "ver" },
+          { modulo: "editar_obra", acao: "ver" },
+          { modulo: "rel_obras", acao: "ver" },
+          { modulo: "rel_pagamento", acao: "ver" },
+          { modulo: "rel_funcionarios", acao: "ver" },
+          { modulo: "rel_empreiteiro", acao: "ver" },
+          { modulo: "rel_cust_obra", acao: "ver" },
+          { modulo: "financeiro_lanc_obra", acao: "ver" },
+          { modulo: "financeiro_lanc_obra", acao: "criar" },
+        ],
+        "Sem permissao para ver todas as obras",
+      ))
+    )
+      return;
+
+    if (
+      false &&
       !(isAdmin(usuario) || isFinanceiro(usuario) || isEncarregado(usuario))
     ) {
       return deny(
         res,
-        "Apenas administrador ou financeiro pode ver todas as obras",
+        "Apenas administrador, financeiro ou encarregado pode ver todas as obras",
       );
     }
 
@@ -4153,11 +5006,25 @@ app.get("/obras/:id", requireAuth, async (req, res) => {
       return res.status(400).json({ ok: false, error: "id inválido (UUID)" });
     }
 
-    if (isConsulta(usuario)) {
+    if (
+      !(await exigirAlgumaPermissao(
+        res,
+        usuario,
+        [
+          { modulo: "editar_obra", acao: "ver" },
+          { modulo: "consult_obras", acao: "ver" },
+          { modulo: "cad_editar_excluir", acao: "ver" },
+        ],
+        "Sem permissao para acessar obra",
+      ))
+    )
+      return;
+
+    if (false && isConsulta(usuario)) {
       return deny(res, "Usuário somente consulta não acessa obra");
     }
 
-    if (!(isAdmin(usuario) || isEncarregado(usuario))) {
+    if (false && !(isAdmin(usuario) || isEncarregado(usuario))) {
       return deny(res, "Apenas administrador ou encarregado pode acessar obra");
     }
 
@@ -4192,7 +5059,18 @@ app.post("/obras", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
 
-    if (!(isAdmin(usuario) || isFinanceiro(usuario))) {
+    if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "cad_obras",
+        "criar",
+        "Sem permissao para cadastrar obra",
+      ))
+    )
+      return;
+
+    if (false && !(isAdmin(usuario) || isFinanceiro(usuario))) {
       return deny(
         res,
         "Apenas administrador ou financeiro pode cadastrar obra",
@@ -4287,7 +5165,18 @@ app.put("/obras/:id", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
 
-    if (!isAdmin(usuario)) {
+    if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "editar_obra",
+        "editar",
+        "Sem permissao para editar obra",
+      ))
+    )
+      return;
+
+    if (false && !isAdmin(usuario)) {
       return deny(res, "Apenas administrador pode editar obra");
     }
 
@@ -4390,7 +5279,18 @@ app.patch("/obras/:id", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
 
-    if (!isAdmin(usuario)) {
+    if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "editar_obra",
+        "editar",
+        "Sem permissao para editar obra",
+      ))
+    )
+      return;
+
+    if (false && !isAdmin(usuario)) {
       return deny(res, "Apenas administrador pode editar obra");
     }
 
@@ -4504,7 +5404,18 @@ app.delete("/obras/:id", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
 
-    if (!isAdmin(usuario)) {
+    if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "editar_obra",
+        "excluir",
+        "Sem permissao para excluir obra",
+      ))
+    )
+      return;
+
+    if (false && !isAdmin(usuario)) {
       return deny(res, "Apenas administrador pode excluir obra");
     }
 
@@ -4554,6 +5465,27 @@ app.get("/quinzenas", requireAuth, async (req, res) => {
     const usuario = await getUsuarioLogado(req.authUser.id);
 
     if (
+      !(await exigirAlgumaPermissao(
+        res,
+        usuario,
+        [
+          { modulo: "cad_quinzena", acao: "ver" },
+          { modulo: "diarias", acao: "ver" },
+          { modulo: "adiantamento", acao: "ver" },
+          { modulo: "relatorios", acao: "ver" },
+          { modulo: "rel_obras", acao: "ver" },
+          { modulo: "rel_funcionarios", acao: "ver" },
+          { modulo: "rel_pagamento", acao: "ver" },
+          { modulo: "rel_empreiteiro", acao: "ver" },
+          { modulo: "rel_cust_obra", acao: "ver" },
+        ],
+        "Sem permissao para listar quinzenas",
+      ))
+    )
+      return;
+
+    if (
+      false &&
       !(isAdmin(usuario) || isFinanceiro(usuario) || isEncarregado(usuario))
     ) {
       return deny(
@@ -4595,6 +5527,18 @@ app.post("/quinzenas", requireAuth, async (req, res) => {
     const usuario = await getUsuarioLogado(req.authUser.id);
 
     if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "cad_quinzena",
+        "criar",
+        "Sem permissao para cadastrar quinzena",
+      ))
+    )
+      return;
+
+    if (
+      false &&
       !(isAdmin(usuario) || isFinanceiro(usuario) || isEncarregado(usuario))
     ) {
       return deny(
@@ -4691,7 +5635,18 @@ app.put("/quinzenas/:id", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
 
-    if (!(isAdmin(usuario) || isFinanceiro(usuario))) {
+    if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "cad_quinzena",
+        "editar",
+        "Sem permissao para editar quinzena",
+      ))
+    )
+      return;
+
+    if (false && !(isAdmin(usuario) || isFinanceiro(usuario))) {
       return deny(
         res,
         "Apenas administrador ou financeiro pode editar quinzena",
@@ -4794,7 +5749,18 @@ app.delete("/quinzenas/:id", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
 
-    if (!isAdmin(usuario)) {
+    if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "cad_quinzena",
+        "excluir",
+        "Sem permissao para excluir quinzena",
+      ))
+    )
+      return;
+
+    if (false && !isAdmin(usuario)) {
       return deny(res, "Apenas administrador pode excluir quinzena");
     }
 
@@ -4853,6 +5819,18 @@ app.get("/relatorios/obras", requireAuth, async (req, res) => {
     }
 
     if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "rel_obras",
+        "ver",
+        "Sem permissao para acessar relatorio por obras",
+      ))
+    )
+      return;
+
+    if (
+      false &&
       !(isAdmin(usuario) || isFinanceiro(usuario) || isEncarregado(usuario))
     ) {
       return deny(
