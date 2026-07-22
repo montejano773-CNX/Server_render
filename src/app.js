@@ -630,6 +630,170 @@ function exigirAdminConfiguracoes(res, usuario) {
   return false;
 }
 
+const CAMPOS_SENSIVEIS_LOG = new Set([
+  "cpf",
+  "rg",
+  "chave_pix",
+  "chave_pix_tipo",
+  "conta",
+  "agencia",
+  "banco",
+  "titular_conta",
+  "dados_bancarios",
+  "documento",
+  "senha",
+  "password",
+  "token",
+  "authorization",
+  "access_token",
+  "refresh_token",
+]);
+
+function mascararValorLog(chave, valor) {
+  const key = String(chave || "").toLowerCase();
+
+  if (CAMPOS_SENSIVEIS_LOG.has(key)) {
+    if (
+      valor &&
+      typeof valor === "object" &&
+      ("antes" in valor || "depois" in valor)
+    ) {
+      return { alterado: true };
+    }
+
+    return "[oculto]";
+  }
+
+  if (Array.isArray(valor)) {
+    return valor.map((item) => mascararValorLog("", item));
+  }
+
+  if (valor && typeof valor === "object") {
+    const out = {};
+    for (const [k, v] of Object.entries(valor)) {
+      out[k] = mascararValorLog(k, v);
+    }
+    return out;
+  }
+
+  return valor;
+}
+
+function classificarLog(row) {
+  const acao = String(row?.acao || "").toUpperCase();
+  const metodo = String(row?.metodo || "").toUpperCase();
+  const tabela = String(row?.tabela || "").toLowerCase();
+  const rota = String(row?.rota || "").toLowerCase();
+
+  if (
+    acao === "DELETE" ||
+    metodo === "DELETE" ||
+    tabela.includes("permissoes") ||
+    rota.includes("permissoes") ||
+    tabela.includes("financeiro") ||
+    rota.includes("financeiro") ||
+    tabela.includes("cadastro_user")
+  ) {
+    return "critico";
+  }
+
+  if (["INSERT", "UPDATE", "PATCH", "PUT", "POST"].includes(acao) || ["POST", "PUT", "PATCH"].includes(metodo)) {
+    return "alteracao";
+  }
+
+  return "consulta";
+}
+
+function prepararLogParaTela(row) {
+  return {
+    id: row.id || null,
+    created_at: row.created_at || null,
+    usuario_id: row.usuario_id || null,
+    usuario_nome: row.usuario_nome || null,
+    usuario_email: row.usuario_email || null,
+    nivel_acesso: row.nivel_acesso || null,
+    acao: row.acao || null,
+    tabela: row.tabela || null,
+    registro_id: row.registro_id || null,
+    rota: row.rota || null,
+    metodo: row.metodo || null,
+    ip: row.ip || null,
+    observacao: row.observacao || null,
+    severidade: classificarLog(row),
+    antes: mascararValorLog("", row.antes),
+    depois: mascararValorLog("", row.depois),
+    diferencas: mascararValorLog("", row.diferencas),
+  };
+}
+
+app.get("/logs", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    if (!exigirAdminConfiguracoes(res, usuario)) return;
+
+    const limit = Math.min(Math.max(Number(req.query?.limit || 50), 1), 100);
+    const page = Math.max(Number(req.query?.page || 1), 1);
+    const from = (page - 1) * limit;
+    const to = from + limit - 1;
+
+    let query = supabaseAdmin
+      .from("logs_sistema")
+      .select(
+        "created_at, usuario_id, usuario_nome, usuario_email, nivel_acesso, acao, tabela, registro_id, antes, depois, diferencas, rota, metodo, ip, observacao",
+        { count: "exact" },
+      )
+      .order("created_at", { ascending: false })
+      .range(from, to);
+
+    const inicio = String(req.query?.inicio || "").trim();
+    const fim = String(req.query?.fim || "").trim();
+    const usuarioBusca = String(req.query?.usuario || "").trim();
+    const acao = String(req.query?.acao || "").trim();
+    const tabela = String(req.query?.tabela || "").trim();
+    const metodo = String(req.query?.metodo || "").trim().toUpperCase();
+    const registroId = String(req.query?.registro_id || "").trim();
+    const rota = String(req.query?.rota || "").trim();
+
+    if (inicio) query = query.gte("created_at", `${inicio}T00:00:00`);
+    if (fim) query = query.lte("created_at", `${fim}T23:59:59`);
+    if (acao) query = query.ilike("acao", `%${acao}%`);
+    if (tabela) query = query.ilike("tabela", `%${tabela}%`);
+    if (metodo) query = query.eq("metodo", metodo);
+    if (registroId) query = query.eq("registro_id", registroId);
+    if (rota) query = query.ilike("rota", `%${rota}%`);
+    if (usuarioBusca) {
+      const safe = usuarioBusca.replace(/[%(),]/g, "");
+      query = query.or(
+        `usuario_nome.ilike.%${safe}%,usuario_email.ilike.%${safe}%`,
+      );
+    }
+
+    const { data, error, count } = await query;
+
+    if (error) {
+      console.error("GET /logs error:", error);
+      return res.status(500).json({ ok: false, error: "Erro ao listar logs" });
+    }
+
+    const rows = (data || []).map(prepararLogParaTela);
+    const severidade = String(req.query?.severidade || "").trim().toLowerCase();
+    const filtradosPorSeveridade = severidade
+      ? rows.filter((row) => row.severidade === severidade)
+      : rows;
+
+    return res.json({
+      ok: true,
+      data: filtradosPorSeveridade,
+      page,
+      limit,
+      total: count || 0,
+    });
+  } catch (err) {
+    console.error("GET /logs exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
 app.get("/permissoes/modulos", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
