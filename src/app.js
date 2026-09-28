@@ -5,6 +5,7 @@ import { requireAuth } from "./middlewares/auth.js";
 import { supabaseAdmin } from "./supabaseAdmin.js";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
+import { limitConcurrentRequests } from "./middlewares/requestLimits.js";
 
 const app = express();
 
@@ -16,13 +17,12 @@ app.use(
   }),
 );
 
-app.use(express.json({ limit: "200kb" }));
-
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
+  windowMs: 60 * 1000,
   max: 300,
   standardHeaders: true,
   legacyHeaders: false,
+  skip: (req) => req.method === "OPTIONS" || req.path === "/health",
   message: {
     ok: false,
     error: "Muitas requisições. Tente novamente mais tarde.",
@@ -43,7 +43,9 @@ app.use(
       if (allowedOrigins.includes(origin)) return callback(null, true);
 
       console.log("❌ CORS BLOQUEADO:", origin, "permitidos:", allowedOrigins);
-      return callback(new Error(`CORS bloqueado para: ${origin}`));
+      const corsError = new Error("Origem não permitida");
+      corsError.code = "CORS_NOT_ALLOWED";
+      return callback(corsError);
     },
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
@@ -52,6 +54,8 @@ app.use(
 );
 
 app.use(limiter);
+app.use(limitConcurrentRequests);
+app.use(express.json({ limit: "200kb" }));
 
 // ==================================================
 // HELPERS
@@ -127,6 +131,107 @@ function normChavePixTipo(body) {
 
   const s = String(v).trim();
   return s === "" ? null : s;
+}
+
+class ApiPublicError extends Error {
+  constructor(message, status = 400) {
+    super(message);
+    this.name = "ApiPublicError";
+    this.status = status;
+    this.publicMessage = message;
+  }
+}
+
+function criarErroPublico(message, status = 400) {
+  return new ApiPublicError(message, status);
+}
+
+function responderErroPublico(
+  res,
+  err,
+  fallback = "Não foi possível concluir a operação.",
+  status = 400,
+) {
+  if (err instanceof ApiPublicError) {
+    return res.status(err.status).json({
+      ok: false,
+      error: err.publicMessage,
+    });
+  }
+
+  return res.status(status).json({
+    ok: false,
+    error: fallback,
+  });
+}
+
+const MAX_REPORT_PERIOD_DAYS = Math.min(
+  Math.max(
+    Number.parseInt(process.env.MAX_REPORT_PERIOD_DAYS || "366", 10) || 366,
+    1,
+  ),
+  3660,
+);
+
+function parseDateOnly(value) {
+  const text = String(value || "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) return null;
+
+  const [year, month, day] = text.split("-").map(Number);
+  const time = Date.UTC(year, month - 1, day);
+  const date = new Date(time);
+
+  if (
+    date.getUTCFullYear() !== year ||
+    date.getUTCMonth() !== month - 1 ||
+    date.getUTCDate() !== day
+  ) {
+    return null;
+  }
+
+  return { text, time };
+}
+
+function todayInSaoPaulo() {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/Sao_Paulo",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date());
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day}`;
+}
+
+function validarPeriodoRelatorio(inicioValue, fimValue) {
+  const inicio = parseDateOnly(inicioValue);
+  const fim = parseDateOnly(fimValue);
+
+  if (!inicio || !fim) {
+    throw criarErroPublico(
+      "Informe datas válidas no formato AAAA-MM-DD.",
+    );
+  }
+
+  if (inicio.time > fim.time) {
+    throw criarErroPublico(
+      "A data inicial deve ser menor ou igual à data final.",
+    );
+  }
+
+  const hoje = todayInSaoPaulo();
+  if (inicio.text > hoje || fim.text > hoje) {
+    throw criarErroPublico("Não é permitido consultar datas futuras.");
+  }
+
+  const totalDays = Math.floor((fim.time - inicio.time) / 86400000) + 1;
+  if (totalDays > MAX_REPORT_PERIOD_DAYS) {
+    throw criarErroPublico(
+      `O período máximo permitido é de ${MAX_REPORT_PERIOD_DAYS} dias.`,
+    );
+  }
+
+  return { inicio: inicio.text, fim: fim.text };
 }
 
 function deny(res, mensagem = "Sem permissão para esta ação") {
@@ -209,6 +314,54 @@ function isObraEquipeEngenharia(obra) {
 
 function isObraAtiva(obra) {
   return String(obra?.situacao || "ativo").trim().toLowerCase() === "ativo";
+}
+
+function isCadastroAtivo(registro) {
+  return String(registro?.situacao || "ativo").trim().toLowerCase() === "ativo";
+}
+
+async function validarObrasAtivas(ids) {
+  const obraIds = [...new Set((ids || []).filter(Boolean))];
+  if (!obraIds.length) return;
+
+  const { data, error } = await supabaseAdmin
+    .from("cadastro_obra")
+    .select("id, nome, situacao")
+    .in("id", obraIds);
+
+  if (error)
+    throw criarErroPublico("Não foi possível validar a obra informada.");
+
+  const encontrados = new Map((data || []).map((obra) => [obra.id, obra]));
+  const ausente = obraIds.find((id) => !encontrados.has(id));
+  if (ausente) throw criarErroPublico("Obra não encontrada.", 404);
+
+  const inativa = (data || []).find((obra) => !isCadastroAtivo(obra));
+  if (inativa) {
+    throw criarErroPublico("Não é permitido lançar em obra inativa.");
+  }
+}
+
+async function validarFuncionariosAtivos(ids) {
+  const funcionarioIds = [...new Set((ids || []).filter(Boolean))];
+  if (!funcionarioIds.length) return;
+
+  const { data, error } = await supabaseAdmin
+    .from("cadastro_func")
+    .select("id, nome, situacao")
+    .in("id", funcionarioIds);
+
+  if (error)
+    throw criarErroPublico("Não foi possível validar o funcionário informado.");
+
+  const encontrados = new Map((data || []).map((func) => [func.id, func]));
+  const ausente = funcionarioIds.find((id) => !encontrados.has(id));
+  if (ausente) throw criarErroPublico("Funcionário não encontrado.", 404);
+
+  const inativo = (data || []).find((func) => !isCadastroAtivo(func));
+  if (inativo) {
+    throw criarErroPublico("Não é permitido lançar para funcionário inativo.");
+  }
 }
 
 async function registrarLog({
@@ -316,6 +469,7 @@ async function temPermissao(usuario, modulo, acao) {
     .trim()
     .toLowerCase();
 
+  if (isAdmin(usuario)) return true;
   if (!usuario?.id || !moduloCodigo || !acaoNormalizada) return false;
 
   const coluna = COLUNA_PERMISSAO[acaoNormalizada];
@@ -430,6 +584,191 @@ async function getEmpreiteiroById(id) {
 
   if (error) return null;
   return data;
+}
+
+function normalizarFuncionariosEmpreiteiro(valor) {
+  if (!Array.isArray(valor)) return [];
+  return [
+    ...new Set(
+      valor
+        .map((id) => String(id || "").trim())
+        .filter(Boolean),
+    ),
+  ];
+}
+
+function listasIguais(a, b) {
+  const listaA = normalizarFuncionariosEmpreiteiro(a);
+  const listaB = normalizarFuncionariosEmpreiteiro(b);
+  return (
+    listaA.length === listaB.length &&
+    listaA.every((valor, indice) => valor === listaB[indice])
+  );
+}
+
+async function carregarEmpreiteirosComVinculos() {
+  const { data, error } = await supabaseAdmin
+    .from("cadastro_empreiteiro")
+    .select("id, nome, funcionarios_ids, created_at")
+    .order("nome", { ascending: true });
+
+  if (error) throw error;
+  return data || [];
+}
+
+async function restaurarEmpreiteiros(alteracoesAplicadas) {
+  for (const alteracao of [...alteracoesAplicadas].reverse()) {
+    const { error } = await supabaseAdmin
+      .from("cadastro_empreiteiro")
+      .update({
+        nome: alteracao.antes.nome,
+        funcionarios_ids: normalizarFuncionariosEmpreiteiro(
+          alteracao.antes.funcionarios_ids,
+        ),
+      })
+      .eq("id", alteracao.antes.id);
+
+    if (error) {
+      console.error("Falha ao restaurar vínculo de empreiteiro:", {
+        empreiteiro_id: alteracao.antes.id,
+        error,
+      });
+    }
+  }
+}
+
+async function aplicarAlteracoesEmpreiteiros(alteracoes) {
+  const aplicadas = [];
+
+  for (const alteracao of alteracoes) {
+    const { error } = await supabaseAdmin
+      .from("cadastro_empreiteiro")
+      .update(alteracao.depois)
+      .eq("id", alteracao.antes.id);
+
+    if (error) {
+      await restaurarEmpreiteiros(aplicadas);
+      throw error;
+    }
+
+    aplicadas.push(alteracao);
+  }
+}
+
+async function getVinculoFuncionario(funcionarioId) {
+  const empreiteiros = await carregarEmpreiteirosComVinculos();
+  const encontrado = empreiteiros.find((empreiteiro) =>
+    normalizarFuncionariosEmpreiteiro(empreiteiro.funcionarios_ids).includes(
+      String(funcionarioId),
+    ),
+  );
+
+  if (!encontrado) return null;
+  return { id: encontrado.id, nome: encontrado.nome };
+}
+
+async function sincronizarVinculoFuncionario(funcionarioId, empreiteiroId) {
+  const funcionario = String(funcionarioId || "").trim();
+  const destino = empreiteiroId ? String(empreiteiroId).trim() : null;
+
+  if (!isUuid(funcionario)) {
+    throw criarErroPublico("Funcionário inválido.");
+  }
+  if (destino && !isUuid(destino)) {
+    throw criarErroPublico("Empreiteiro inválido.");
+  }
+
+  const empreiteiros = await carregarEmpreiteirosComVinculos();
+  if (destino && !empreiteiros.some((item) => item.id === destino)) {
+    throw criarErroPublico("Empreiteiro não encontrado.", 404);
+  }
+
+  const alteracoes = [];
+  for (const empreiteiro of empreiteiros) {
+    const atuais = normalizarFuncionariosEmpreiteiro(
+      empreiteiro.funcionarios_ids,
+    );
+    const semFuncionario = atuais.filter((id) => id !== funcionario);
+    const novos =
+      destino === empreiteiro.id
+        ? [...semFuncionario, funcionario]
+        : semFuncionario;
+
+    if (!listasIguais(atuais, novos)) {
+      alteracoes.push({
+        antes: empreiteiro,
+        depois: { funcionarios_ids: novos },
+      });
+    }
+  }
+
+  await aplicarAlteracoesEmpreiteiros(alteracoes);
+  return destino
+    ? empreiteiros.find((item) => item.id === destino) || null
+    : null;
+}
+
+async function atualizarEmpreiteiroComVinculos(
+  empreiteiroId,
+  nome,
+  funcionariosIds,
+) {
+  const empreiteiros = await carregarEmpreiteirosComVinculos();
+  const alvo = empreiteiros.find((item) => item.id === empreiteiroId);
+  if (!alvo) throw criarErroPublico("Empreiteiro não encontrado.", 404);
+
+  const desejados = normalizarFuncionariosEmpreiteiro(funcionariosIds);
+  const desejadosSet = new Set(desejados);
+  const alteracoes = [];
+
+  for (const empreiteiro of empreiteiros) {
+    const atuais = normalizarFuncionariosEmpreiteiro(
+      empreiteiro.funcionarios_ids,
+    );
+    const novos =
+      empreiteiro.id === empreiteiroId
+        ? desejados
+        : atuais.filter((id) => !desejadosSet.has(id));
+    const novoNome =
+      empreiteiro.id === empreiteiroId ? nome : empreiteiro.nome;
+
+    if (novoNome !== empreiteiro.nome || !listasIguais(atuais, novos)) {
+      alteracoes.push({
+        antes: empreiteiro,
+        depois: { nome: novoNome, funcionarios_ids: novos },
+      });
+    }
+  }
+
+  await aplicarAlteracoesEmpreiteiros(alteracoes);
+}
+
+async function validarFuncionariosParaVinculo(usuario, funcionariosIds) {
+  const ids = normalizarFuncionariosEmpreiteiro(funcionariosIds);
+  for (const funcionarioId of ids) {
+    if (!isUuid(funcionarioId)) {
+      throw criarErroPublico("Um dos funcionários informados é inválido.");
+    }
+  }
+  if (!ids.length) return ids;
+
+  const { data, error } = await supabaseAdmin
+    .from("cadastro_func")
+    .select("id, nome, funcao, situacao")
+    .in("id", ids);
+  if (error) throw error;
+
+  const validos = (data || []).filter(
+    (funcionario) =>
+      isCadastroAtivo(funcionario) && podeVerFuncionario(usuario, funcionario),
+  );
+  if (validos.length !== ids.length) {
+    throw criarErroPublico(
+      "Um ou mais funcionários não existem, estão inativos ou não podem ser vinculados.",
+    );
+  }
+
+  return ids;
 }
 
 async function getEmpreitaById(id) {
@@ -1213,117 +1552,6 @@ app.post("/usuarios", requireAuth, async (req, res) => {
   }
 });
 
-app.patch("/usuarios/:id", requireAuth, async (req, res) => {
-  try {
-    const usuario = await getUsuarioLogado(req.authUser.id);
-    const id = req.params.id;
-
-    if (
-      !(await exigirPermissao(
-        res,
-        usuario,
-        "editar_usuario",
-        "editar",
-        "Sem permissao para editar usuarios",
-      ))
-    )
-      return;
-
-    if (false && !isAdmin(usuario)) {
-      return deny(res, "Apenas administrador pode editar usuários");
-    }
-
-    const antes = await getUsuarioById(id);
-
-    const patch = {
-      ...(req.body?.nome !== undefined
-        ? { nome: String(req.body.nome).trim() }
-        : {}),
-      ...(req.body?.situacao !== undefined
-        ? { situacao: normSituacao(req.body.situacao) }
-        : {}),
-      ...(req.body?.observacao !== undefined
-        ? {
-            observacao: req.body.observacao
-              ? String(req.body.observacao).trim()
-              : null,
-          }
-        : {}),
-    };
-
-    const novoEmail =
-      req.body?.email !== undefined
-        ? String(req.body.email || "").trim()
-        : null;
-
-    const novaSenha =
-      req.body?.senha !== undefined
-        ? String(req.body.senha || "").trim()
-        : null;
-
-    if (novoEmail) patch.email = novoEmail;
-
-    if (Object.keys(patch).length > 0) {
-      const { error: upErr } = await supabaseAdmin
-        .from("cadastro_user")
-        .update(patch)
-        .eq("id", id);
-
-      if (upErr) {
-        console.error("PATCH /usuarios/:id update cadastro_user error:", upErr);
-        return res
-          .status(500)
-          .json({ ok: false, error: "Falha ao atualizar usuário" });
-      }
-    }
-
-    if (novoEmail || novaSenha) {
-      const payloadAuth = {};
-      if (novoEmail) payloadAuth.email = novoEmail;
-      if (novaSenha) {
-        if (novaSenha.length < 6) {
-          return res.status(400).json({
-            ok: false,
-            error: "senha precisa ter pelo menos 6 caracteres",
-          });
-        }
-        payloadAuth.password = novaSenha;
-      }
-
-      const { error: authErr } = await supabaseAdmin.auth.admin.updateUserById(
-        id,
-        payloadAuth,
-      );
-
-      if (authErr) {
-        console.error("PATCH /usuarios/:id update Auth error:", authErr);
-        return res.status(200).json({
-          ok: true,
-          warning: "Atualizou cadastro_user, mas falhou ao atualizar Auth",
-        });
-      }
-    }
-
-    const depois = await getUsuarioById(id);
-
-    await registrarLog({
-      req,
-      usuario,
-      acao: "PATCH",
-      tabela: "cadastro_user",
-      registro_id: id,
-      antes,
-      depois,
-      observacao: "Atualizou usuário",
-    });
-
-    return res.json({ ok: true });
-  } catch (err) {
-    console.error("PATCH /usuarios/:id exception:", err);
-    return res.status(500).json({ ok: false, error: "Erro interno" });
-  }
-});
-
 app.delete("/usuarios/:id", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
@@ -1419,15 +1647,10 @@ app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
       );
     }
 
-    const inicio = String(req.query?.inicio || "").trim();
-    const fim = String(req.query?.fim || "").trim();
-
-    if (!inicio || !fim) {
-      return res.status(400).json({
-        ok: false,
-        error: "Informe inicio e fim no formato YYYY-MM-DD",
-      });
-    }
+    const { inicio, fim } = validarPeriodoRelatorio(
+      req.query?.inicio,
+      req.query?.fim,
+    );
 
     let obraIdsPermitidas = null;
 
@@ -1578,7 +1801,12 @@ app.get("/relatorios/pagamento", requireAuth, async (req, res) => {
     });
   } catch (err) {
     console.error("GET /relatorios/pagamento exception:", err);
-    return res.status(500).json({ ok: false, error: "Erro interno" });
+    return responderErroPublico(
+      res,
+      err,
+      "Não foi possível gerar o relatório de pagamento.",
+      500,
+    );
   }
 });
 
@@ -1676,6 +1904,11 @@ app.get("/financeiro/fornecedores", requireAuth, async (req, res) => {
         usuario,
         [
           { modulo: "financeiro_fornecedores", acao: "ver" },
+          { modulo: "financeiro_fornecedor_cadastro", acao: "criar" },
+          { modulo: "financeiro_fornecedor_editar", acao: "editar" },
+          { modulo: "financeiro_compra_cadastro", acao: "criar" },
+          { modulo: "financeiro_compras", acao: "ver" },
+          { modulo: "financeiro_compra_editar", acao: "editar" },
           { modulo: "financeiro_lanc_obra", acao: "ver" },
           { modulo: "financeiro_lanc_obra", acao: "criar" },
           { modulo: "financeiro_contas_empresa", acao: "ver" },
@@ -1716,7 +1949,7 @@ app.post("/financeiro/fornecedores", requireAuth, async (req, res) => {
       !(await exigirPermissao(
         res,
         usuario,
-        "financeiro_fornecedores",
+        "financeiro_fornecedor_cadastro",
         "criar",
         "Sem permissao para cadastrar fornecedor",
       ))
@@ -1746,7 +1979,40 @@ app.post("/financeiro/fornecedores", requireAuth, async (req, res) => {
     console.error("POST /financeiro/fornecedores exception:", err);
     return res
       .status(400)
-      .json({ ok: false, error: err.message || "Erro ao salvar fornecedor" });
+      .json({ ok: false, error: "Não foi possível salvar o fornecedor." });
+  }
+});
+
+app.get("/financeiro/fornecedores/:id", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "financeiro_fornecedor_editar",
+        "editar",
+        "Sem permissao para editar fornecedor",
+      ))
+    )
+      return;
+
+    const id = String(req.params.id || "").trim();
+    if (!isUuid(id))
+      return res.status(400).json({ ok: false, error: "ID inválido" });
+
+    const { data, error } = await supabaseAdmin
+      .from("financeiro_fornecedores")
+      .select("*")
+      .eq("id", id)
+      .maybeSingle();
+    if (error) throw error;
+    if (!data)
+      return res.status(404).json({ ok: false, error: "Fornecedor não encontrado" });
+    return res.json({ ok: true, data });
+  } catch (err) {
+    console.error("GET /financeiro/fornecedores/:id exception:", err);
+    return responderErroPublico(res, err, "Não foi possível carregar o fornecedor.");
   }
 });
 
@@ -1758,7 +2024,7 @@ app.put("/financeiro/fornecedores/:id", requireAuth, async (req, res) => {
       !(await exigirPermissao(
         res,
         usuario,
-        "financeiro_fornecedores",
+        "financeiro_fornecedor_editar",
         "editar",
         "Sem permissao para editar fornecedor",
       ))
@@ -1797,7 +2063,7 @@ app.put("/financeiro/fornecedores/:id", requireAuth, async (req, res) => {
     console.error("PUT /financeiro/fornecedores/:id exception:", err);
     return res
       .status(400)
-      .json({ ok: false, error: err.message || "Erro ao editar fornecedor" });
+      .json({ ok: false, error: "Não foi possível editar o fornecedor." });
   }
 });
 
@@ -1809,7 +2075,7 @@ app.delete("/financeiro/fornecedores/:id", requireAuth, async (req, res) => {
       !(await exigirPermissao(
         res,
         usuario,
-        "financeiro_fornecedores",
+        "financeiro_fornecedor_editar",
         "excluir",
         "Sem permissao para excluir fornecedor",
       ))
@@ -1844,7 +2110,7 @@ app.delete("/financeiro/fornecedores/:id", requireAuth, async (req, res) => {
     console.error("DELETE /financeiro/fornecedores/:id exception:", err);
     return res
       .status(400)
-      .json({ ok: false, error: err.message || "Erro ao excluir fornecedor" });
+      .json({ ok: false, error: "Não foi possível excluir o fornecedor." });
   }
 });
 
@@ -1931,6 +2197,8 @@ app.post("/financeiro/lancamentos-obra", requireAuth, async (req, res) => {
     const payload = normalizarLancamentoFinanceiroPayload(req.body, {
       exigeObra: true,
     });
+    await validarObrasAtivas([payload.obra_id]);
+
     const pode = await usuarioPodeAcessarObra(usuario, payload.obra_id);
     if (!pode) return deny(res, "Você não pode lançar nesta obra");
 
@@ -1952,12 +2220,11 @@ app.post("/financeiro/lancamentos-obra", requireAuth, async (req, res) => {
     return res.status(201).json({ ok: true, data });
   } catch (err) {
     console.error("POST /financeiro/lancamentos-obra exception:", err);
-    return res
-      .status(400)
-      .json({
-        ok: false,
-        error: err.message || "Erro ao salvar lançamento de obra",
-      });
+    return responderErroPublico(
+      res,
+      err,
+      "Não foi possível salvar o lançamento de obra.",
+    );
   }
 });
 
@@ -1993,6 +2260,8 @@ app.put("/financeiro/lancamentos-obra/:id", requireAuth, async (req, res) => {
     const payload = normalizarLancamentoFinanceiroPayload(req.body, {
       exigeObra: true,
     });
+    await validarObrasAtivas([payload.obra_id]);
+
     const podeAntes = await usuarioPodeAcessarObra(usuario, antes.obra_id);
     const podeNovo = await usuarioPodeAcessarObra(usuario, payload.obra_id);
     if (!podeAntes || !podeNovo)
@@ -2018,12 +2287,11 @@ app.put("/financeiro/lancamentos-obra/:id", requireAuth, async (req, res) => {
     return res.json({ ok: true, data });
   } catch (err) {
     console.error("PUT /financeiro/lancamentos-obra/:id exception:", err);
-    return res
-      .status(400)
-      .json({
-        ok: false,
-        error: err.message || "Erro ao editar lançamento de obra",
-      });
+    return responderErroPublico(
+      res,
+      err,
+      "Não foi possível editar o lançamento de obra.",
+    );
   }
 });
 
@@ -2075,7 +2343,7 @@ app.delete(
         .status(400)
         .json({
           ok: false,
-          error: err.message || "Erro ao excluir lançamento de obra",
+          error: "Não foi possível excluir o lançamento de obra.",
         });
     }
   },
@@ -2165,7 +2433,7 @@ app.post("/financeiro/contas-empresa", requireAuth, async (req, res) => {
       .status(400)
       .json({
         ok: false,
-        error: err.message || "Erro ao salvar conta da empresa",
+        error: "Não foi possível salvar a conta da empresa.",
       });
   }
 });
@@ -2222,7 +2490,7 @@ app.put("/financeiro/contas-empresa/:id", requireAuth, async (req, res) => {
       .status(400)
       .json({
         ok: false,
-        error: err.message || "Erro ao editar conta da empresa",
+        error: "Não foi possível editar a conta da empresa.",
       });
   }
 });
@@ -2272,8 +2540,586 @@ app.delete("/financeiro/contas-empresa/:id", requireAuth, async (req, res) => {
       .status(400)
       .json({
         ok: false,
-        error: err.message || "Erro ao excluir conta da empresa",
+        error: "Não foi possível excluir a conta da empresa.",
       });
+  }
+});
+
+// ==================================================
+// FINANCEIRO NOVO - PLANO DE CONTAS / CENTRO DE CUSTO / CONTAS A PAGAR
+// ==================================================
+async function exigirModuloFinanceiro(res, usuario, modulo, acao = "ver") {
+  if (isAdmin(usuario)) return true;
+  return exigirPermissao(
+    res,
+    usuario,
+    modulo,
+    acao,
+    "Sem permissão para acessar esta área do financeiro",
+  );
+}
+
+function normalizarSituacaoFinanceira(v) {
+  const s = String(v || "ativo").trim().toLowerCase();
+  return s === "inativo" ? "inativo" : "ativo";
+}
+
+function normalizarStatusConta(v) {
+  const s = String(v || "aberto").trim().toLowerCase();
+  return ["aberto", "quitado", "cancelado"].includes(s) ? s : "aberto";
+}
+
+function normalizarTipoPagamento(v) {
+  const s = String(v || "a_vista").trim().toLowerCase();
+  return ["a_vista", "cartao_credito", "boleto", "pix", "transferencia", "outro"].includes(s)
+    ? s
+    : "a_vista";
+}
+
+function parseValorReais(v, campo = "valor") {
+  if (v === undefined || v === null || v === "") {
+    throw criarErroPublico(`Informe ${campo}.`);
+  }
+  const raw = String(v).trim();
+  const normalizado = raw.includes(",")
+    ? raw.replace(/\./g, "").replace(",", ".")
+    : raw;
+  const n = Number(normalizado);
+  if (!Number.isFinite(n) || n < 0) throw criarErroPublico(`${campo} inválido.`);
+  return n;
+}
+
+function mesAnoFromDate(data) {
+  const s = String(data || "").slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
+  return `${s.slice(5, 7)}/${s.slice(0, 4)}`;
+}
+
+function addMeses(data, meses) {
+  const base = new Date(`${String(data).slice(0, 10)}T00:00:00`);
+  if (Number.isNaN(base.getTime())) return String(data || "").slice(0, 10);
+  base.setMonth(base.getMonth() + meses);
+  return base.toISOString().slice(0, 10);
+}
+
+function parcelasDaCompraPayload(compra, body = {}) {
+  const statusCompra = normalizarStatusConta(compra?.status);
+  const valorTotal = Number(compra?.valor_total || 0);
+  const numeroParcelas = Math.max(1, Math.trunc(Number(compra?.numero_parcelas || 1)));
+  const valorParcela = Math.round((valorTotal / numeroParcelas) * 100) / 100;
+  const statusParcela =
+    statusCompra === "quitado"
+      ? "quitado"
+      : statusCompra === "cancelado"
+        ? "cancelado"
+        : "aberto";
+  const dataPagamento =
+    statusParcela === "quitado"
+      ? limitarTexto(body?.data_pagamento, 10) || compra?.data_compra
+      : null;
+
+  return Array.from({ length: numeroParcelas }, (_, i) => ({
+    compra_id: compra.id,
+    numero: i + 1,
+    valor:
+      i + 1 === numeroParcelas
+        ? Math.round((valorTotal - valorParcela * (numeroParcelas - 1)) * 100) / 100
+        : valorParcela,
+    vencimento: addMeses(body?.primeiro_vencimento || compra?.data_compra, i),
+    status: statusParcela,
+    data_pagamento: dataPagamento,
+    comprovante_url: limitarTexto(body?.comprovante_url, 1000),
+    nota_fiscal_url: limitarTexto(body?.nota_fiscal_url, 1000),
+    observacao: null,
+  }));
+}
+
+function normalizarPlanoContaPayload(body = {}) {
+  const nome = limitarTexto(body.nome, 160);
+  if (!nome) throw criarErroPublico("Informe o nome do plano de contas.");
+  return {
+    nome: nome.toUpperCase(),
+    codigo: limitarTexto(body.codigo, 30),
+    situacao: normalizarSituacaoFinanceira(body.situacao),
+    observacao: limitarTexto(body.observacao, 500),
+  };
+}
+
+function normalizarCentroCustoPayload(body = {}) {
+  const nome = limitarTexto(body.nome, 160);
+  const tipo = String(body.tipo || "obra").trim().toLowerCase();
+  const obra_id = String(body.obra_id || "").trim();
+  if (!nome) throw criarErroPublico("Informe o nome do centro de custo.");
+  if (!["obra", "administrativo", "empresa", "outro"].includes(tipo)) {
+    throw criarErroPublico("Tipo de centro de custo inválido.");
+  }
+  if (obra_id && !isUuid(obra_id)) throw criarErroPublico("Obra inválida.");
+  return {
+    nome: nome.toUpperCase(),
+    tipo,
+    obra_id: obra_id || null,
+    situacao: normalizarSituacaoFinanceira(body.situacao),
+    observacao: limitarTexto(body.observacao, 500),
+  };
+}
+
+function normalizarCompraFinanceiraPayload(body = {}) {
+  const centro_custo_id = String(body.centro_custo_id || "").trim();
+  const plano_conta_id = String(body.plano_conta_id || "").trim();
+  const fornecedor_id = String(body.fornecedor_id || "").trim();
+  const data_compra = limitarTexto(body.data_compra, 10);
+  const descricao = limitarTexto(body.descricao, 500);
+  const parcelasInformadas = Number(body.numero_parcelas || 1);
+  const numero_parcelas = Number.isFinite(parcelasInformadas)
+    ? Math.max(1, Math.min(Math.trunc(parcelasInformadas), 60))
+    : 1;
+  const valor_total = parseValorReais(body.valor_total, "o valor total");
+
+  if (!isUuid(centro_custo_id)) throw criarErroPublico("Informe o centro de custo.");
+  if (!isUuid(plano_conta_id)) throw criarErroPublico("Informe o plano de contas.");
+  if (!isUuid(fornecedor_id)) throw criarErroPublico("Informe o fornecedor.");
+  if (!data_compra) throw criarErroPublico("Informe a data da compra.");
+  if (!descricao) throw criarErroPublico("Informe a descrição/documento.");
+
+  return {
+    centro_custo_id,
+    plano_conta_id,
+    fornecedor_id,
+    data_compra,
+    status: normalizarStatusConta(body.status),
+    tipo_pagamento: normalizarTipoPagamento(body.tipo_pagamento),
+    numero_parcelas,
+    valor_total,
+    descricao,
+    mes_compra: limitarTexto(body.mes_compra, 7) || mesAnoFromDate(data_compra),
+    observacao: limitarTexto(body.observacao, 500),
+  };
+}
+
+function normalizarParcelaFinanceiraPayload(body = {}) {
+  return {
+    status: normalizarStatusConta(body.status),
+    data_pagamento: limitarTexto(body.data_pagamento, 10) || null,
+    comprovante_url: limitarTexto(body.comprovante_url, 1000),
+    nota_fiscal_url: limitarTexto(body.nota_fiscal_url, 1000),
+    observacao: limitarTexto(body.observacao, 500),
+  };
+}
+
+async function carregarComprasComParcelas(compras) {
+  const rows = compras || [];
+  const ids = rows.map((c) => c.id).filter(Boolean);
+  if (!ids.length) return rows.map((c) => ({ ...c, parcelas: [] }));
+
+  const { data: parcelas, error } = await supabaseAdmin
+    .from("financeiro_parcelas")
+    .select("*")
+    .in("compra_id", ids)
+    .order("numero", { ascending: true });
+  if (error) throw error;
+
+  const porCompra = new Map();
+  (parcelas || []).forEach((p) => {
+    if (!porCompra.has(p.compra_id)) porCompra.set(p.compra_id, []);
+    porCompra.get(p.compra_id).push(p);
+  });
+  return rows.map((c) => ({ ...c, parcelas: porCompra.get(c.id) || [] }));
+}
+
+app.get("/financeiro/plano-contas", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    if (
+      !(await exigirAlgumaPermissao(
+        res,
+        usuario,
+        [
+          { modulo: "financeiro_plano_contas", acao: "ver" },
+          { modulo: "financeiro_plano_contas", acao: "criar" },
+          { modulo: "financeiro_plano_contas", acao: "editar" },
+          { modulo: "financeiro_compra_cadastro", acao: "criar" },
+          { modulo: "financeiro_compras", acao: "ver" },
+          { modulo: "financeiro_compra_editar", acao: "editar" },
+        ],
+        "Sem permissão para acessar o plano de contas",
+      ))
+    )
+      return;
+    const situacao = String(req.query?.situacao || "").trim().toLowerCase();
+    let query = supabaseAdmin
+      .from("financeiro_planos_contas")
+      .select("*")
+      .order("nome", { ascending: true });
+    if (["ativo", "inativo"].includes(situacao)) query = query.eq("situacao", situacao);
+    const { data, error } = await query;
+    if (error) throw error;
+    return res.json({ ok: true, data: data || [] });
+  } catch (err) {
+    console.error("GET /financeiro/plano-contas exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro ao listar plano de contas" });
+  }
+});
+
+app.post("/financeiro/plano-contas", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    if (!(await exigirModuloFinanceiro(res, usuario, "financeiro_plano_contas", "criar"))) return;
+    const payload = normalizarPlanoContaPayload(req.body);
+    const { data, error } = await supabaseAdmin
+      .from("financeiro_planos_contas")
+      .insert(payload)
+      .select("*")
+      .single();
+    if (error) throw error;
+    await registrarLog({ req, usuario, acao: "CREATE", tabela: "financeiro_planos_contas", registro_id: data?.id, depois: data, observacao: "Cadastrou plano de contas" });
+    return res.status(201).json({ ok: true, data });
+  } catch (err) {
+    console.error("POST /financeiro/plano-contas exception:", err);
+    return responderErroPublico(res, err, "Não foi possível salvar o plano de contas.");
+  }
+});
+
+app.put("/financeiro/plano-contas/:id", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    if (!(await exigirModuloFinanceiro(res, usuario, "financeiro_plano_contas", "editar"))) return;
+    const id = String(req.params.id || "").trim();
+    if (!isUuid(id)) return res.status(400).json({ ok: false, error: "ID inválido" });
+    const { data: antes } = await supabaseAdmin.from("financeiro_planos_contas").select("*").eq("id", id).maybeSingle();
+    const payload = normalizarPlanoContaPayload(req.body);
+    const { data, error } = await supabaseAdmin
+      .from("financeiro_planos_contas")
+      .update(payload)
+      .eq("id", id)
+      .select("*")
+      .single();
+    if (error) throw error;
+    await registrarLog({ req, usuario, acao: "UPDATE", tabela: "financeiro_planos_contas", registro_id: id, antes, depois: data, observacao: "Editou plano de contas" });
+    return res.json({ ok: true, data });
+  } catch (err) {
+    console.error("PUT /financeiro/plano-contas/:id exception:", err);
+    return responderErroPublico(res, err, "Não foi possível editar o plano de contas.");
+  }
+});
+
+app.delete("/financeiro/plano-contas/:id", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    if (!(await exigirModuloFinanceiro(res, usuario, "financeiro_plano_contas", "excluir"))) return;
+    const id = String(req.params.id || "").trim();
+    if (!isUuid(id)) return res.status(400).json({ ok: false, error: "ID inválido" });
+    const { data: antes } = await supabaseAdmin.from("financeiro_planos_contas").select("*").eq("id", id).maybeSingle();
+    const { error } = await supabaseAdmin.from("financeiro_planos_contas").delete().eq("id", id);
+    if (error) throw error;
+    await registrarLog({ req, usuario, acao: "DELETE", tabela: "financeiro_planos_contas", registro_id: id, antes, observacao: "Excluiu plano de contas" });
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("DELETE /financeiro/plano-contas/:id exception:", err);
+    return res.status(400).json({ ok: false, error: "Não foi possível excluir o plano de contas." });
+  }
+});
+
+app.get("/financeiro/centros-custo", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    if (
+      !(await exigirAlgumaPermissao(
+        res,
+        usuario,
+        [
+          { modulo: "financeiro_centros_custo", acao: "ver" },
+          { modulo: "financeiro_centros_custo", acao: "criar" },
+          { modulo: "financeiro_centros_custo", acao: "editar" },
+          { modulo: "financeiro_compra_cadastro", acao: "criar" },
+          { modulo: "financeiro_compras", acao: "ver" },
+          { modulo: "financeiro_compra_editar", acao: "editar" },
+        ],
+        "Sem permissão para acessar os centros de custo",
+      ))
+    )
+      return;
+    const situacao = String(req.query?.situacao || "").trim().toLowerCase();
+    let query = supabaseAdmin
+      .from("financeiro_centros_custo")
+      .select("*")
+      .order("nome", { ascending: true });
+    if (["ativo", "inativo"].includes(situacao)) query = query.eq("situacao", situacao);
+    const { data, error } = await query;
+    if (error) throw error;
+    return res.json({ ok: true, data: data || [] });
+  } catch (err) {
+    console.error("GET /financeiro/centros-custo exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro ao listar centros de custo" });
+  }
+});
+
+app.post("/financeiro/centros-custo", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    if (!(await exigirModuloFinanceiro(res, usuario, "financeiro_centros_custo", "criar"))) return;
+    const payload = normalizarCentroCustoPayload(req.body);
+    const { data, error } = await supabaseAdmin
+      .from("financeiro_centros_custo")
+      .insert(payload)
+      .select("*")
+      .single();
+    if (error) throw error;
+    await registrarLog({ req, usuario, acao: "CREATE", tabela: "financeiro_centros_custo", registro_id: data?.id, depois: data, observacao: "Cadastrou centro de custo" });
+    return res.status(201).json({ ok: true, data });
+  } catch (err) {
+    console.error("POST /financeiro/centros-custo exception:", err);
+    return responderErroPublico(res, err, "Não foi possível salvar o centro de custo.");
+  }
+});
+
+app.put("/financeiro/centros-custo/:id", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    if (!(await exigirModuloFinanceiro(res, usuario, "financeiro_centros_custo", "editar"))) return;
+    const id = String(req.params.id || "").trim();
+    if (!isUuid(id)) return res.status(400).json({ ok: false, error: "ID inválido" });
+    const { data: antes } = await supabaseAdmin.from("financeiro_centros_custo").select("*").eq("id", id).maybeSingle();
+    const payload = normalizarCentroCustoPayload(req.body);
+    const { data, error } = await supabaseAdmin
+      .from("financeiro_centros_custo")
+      .update(payload)
+      .eq("id", id)
+      .select("*")
+      .single();
+    if (error) throw error;
+    await registrarLog({ req, usuario, acao: "UPDATE", tabela: "financeiro_centros_custo", registro_id: id, antes, depois: data, observacao: "Editou centro de custo" });
+    return res.json({ ok: true, data });
+  } catch (err) {
+    console.error("PUT /financeiro/centros-custo/:id exception:", err);
+    return responderErroPublico(res, err, "Não foi possível editar o centro de custo.");
+  }
+});
+
+app.delete("/financeiro/centros-custo/:id", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    if (!(await exigirModuloFinanceiro(res, usuario, "financeiro_centros_custo", "excluir"))) return;
+    const id = String(req.params.id || "").trim();
+    if (!isUuid(id)) return res.status(400).json({ ok: false, error: "ID inválido" });
+    const { data: antes } = await supabaseAdmin.from("financeiro_centros_custo").select("*").eq("id", id).maybeSingle();
+    const { error } = await supabaseAdmin.from("financeiro_centros_custo").delete().eq("id", id);
+    if (error) throw error;
+    await registrarLog({ req, usuario, acao: "DELETE", tabela: "financeiro_centros_custo", registro_id: id, antes, observacao: "Excluiu centro de custo" });
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("DELETE /financeiro/centros-custo/:id exception:", err);
+    return res.status(400).json({ ok: false, error: "Não foi possível excluir o centro de custo." });
+  }
+});
+
+app.get("/financeiro/compras", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    if (
+      !(await exigirAlgumaPermissao(
+        res,
+        usuario,
+        [
+          { modulo: "financeiro_compras", acao: "ver" },
+          { modulo: "financeiro_compra_editar", acao: "editar" },
+        ],
+        "Sem permissão para consultar compras",
+      ))
+    )
+      return;
+    let query = supabaseAdmin
+      .from("financeiro_compras")
+      .select("*")
+      .order("data_compra", { ascending: false })
+      .limit(200);
+    const centro = String(req.query?.centro_custo_id || "").trim();
+    const plano = String(req.query?.plano_conta_id || "").trim();
+    const fornecedor = String(req.query?.fornecedor_id || "").trim();
+    const status = String(req.query?.status || "").trim().toLowerCase();
+    if (isUuid(centro)) query = query.eq("centro_custo_id", centro);
+    if (isUuid(plano)) query = query.eq("plano_conta_id", plano);
+    if (isUuid(fornecedor)) query = query.eq("fornecedor_id", fornecedor);
+    if (["aberto", "quitado", "cancelado"].includes(status)) query = query.eq("status", status);
+    const { data, error } = await query;
+    if (error) throw error;
+    const out = await carregarComprasComParcelas(data || []);
+    return res.json({ ok: true, data: out });
+  } catch (err) {
+    console.error("GET /financeiro/compras exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro ao listar compras" });
+  }
+});
+
+app.get("/financeiro/compras/:id", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    if (!(await exigirModuloFinanceiro(res, usuario, "financeiro_compra_editar", "editar"))) return;
+
+    const id = String(req.params.id || "").trim();
+    if (!isUuid(id)) return res.status(400).json({ ok: false, error: "ID inválido" });
+
+    const { data, error } = await supabaseAdmin
+      .from("financeiro_compras")
+      .select("*")
+      .eq("id", id)
+      .maybeSingle();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ ok: false, error: "Compra não encontrada" });
+
+    const [compra] = await carregarComprasComParcelas([data]);
+    return res.json({ ok: true, data: compra });
+  } catch (err) {
+    console.error("GET /financeiro/compras/:id exception:", err);
+    return responderErroPublico(res, err, "Não foi possível carregar a compra.");
+  }
+});
+
+app.post("/financeiro/compras", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    if (!(await exigirModuloFinanceiro(res, usuario, "financeiro_compra_cadastro", "criar"))) return;
+    const payload = normalizarCompraFinanceiraPayload(req.body);
+    const parcelas = parcelasDaCompraPayload({ ...payload, id: null }, req.body)
+      .map(({ compra_id, ...parcela }) => parcela);
+    const { data: resultado, error } = await supabaseAdmin.rpc(
+      "financeiro_criar_compra_atomica",
+      {
+        p_compra: { ...payload, created_by: req.authUser?.id || null },
+        p_parcelas: parcelas,
+      },
+    );
+    if (error) throw error;
+    const compra = resultado?.compra;
+    const parcelasCriadas = resultado?.parcelas || [];
+    await registrarLog({ req, usuario, acao: "CREATE", tabela: "financeiro_compras", registro_id: compra.id, depois: { compra, parcelas: parcelasCriadas }, observacao: "Cadastrou compra financeira" });
+    return res.status(201).json({ ok: true, data: { ...compra, parcelas: parcelasCriadas } });
+  } catch (err) {
+    console.error("POST /financeiro/compras exception:", err);
+    return responderErroPublico(res, err, "Não foi possível salvar a compra.");
+  }
+});
+
+app.put("/financeiro/compras/:id", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    if (!(await exigirModuloFinanceiro(res, usuario, "financeiro_compra_editar", "editar"))) return;
+    const id = String(req.params.id || "").trim();
+    if (!isUuid(id)) return res.status(400).json({ ok: false, error: "ID inválido" });
+    const { data: antes } = await supabaseAdmin.from("financeiro_compras").select("*").eq("id", id).maybeSingle();
+    if (!antes) return res.status(404).json({ ok: false, error: "Compra não encontrada" });
+    const payload = normalizarCompraFinanceiraPayload(req.body);
+    const { data: parcelasAntes, error: parcelasAntesError } = await supabaseAdmin
+      .from("financeiro_parcelas")
+      .select("*")
+      .eq("compra_id", id)
+      .order("numero", { ascending: true });
+    if (parcelasAntesError) throw parcelasAntesError;
+
+    const temParcelaQuitada = (parcelasAntes || []).some((p) => p.status === "quitado");
+    const primeiroVencimentoAtual = parcelasAntes?.[0]?.vencimento || antes.data_compra;
+    const primeiroVencimentoNovo =
+      limitarTexto(req.body?.primeiro_vencimento, 10) || primeiroVencimentoAtual;
+    const alterouEstruturaParcelas =
+      Number(payload.valor_total) !== Number(antes.valor_total) ||
+      Number(payload.numero_parcelas) !== Number(antes.numero_parcelas) ||
+      primeiroVencimentoNovo !== primeiroVencimentoAtual;
+
+    if (temParcelaQuitada && alterouEstruturaParcelas) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "Não é possível recalcular parcelas de uma compra com parcela quitada. Ajuste as parcelas em Contas a pagar.",
+      });
+    }
+
+    const parcelas = temParcelaQuitada
+      ? []
+      : parcelasDaCompraPayload({ ...payload, id }, {
+        ...req.body,
+        primeiro_vencimento: primeiroVencimentoNovo,
+      }).map(({ compra_id, ...parcela }) => parcela);
+
+    const { data: resultado, error } = await supabaseAdmin.rpc(
+      "financeiro_atualizar_compra_atomica",
+      {
+        p_id: id,
+        p_compra: payload,
+        p_parcelas: parcelas,
+        p_recriar_parcelas: !temParcelaQuitada,
+      },
+    );
+    if (error) throw error;
+    const data = resultado?.compra;
+    const parcelasDepois = resultado?.parcelas || [];
+
+    await registrarLog({ req, usuario, acao: "UPDATE", tabela: "financeiro_compras", registro_id: id, antes: { compra: antes, parcelas: parcelasAntes }, depois: { compra: data, parcelas: parcelasDepois }, observacao: "Editou compra financeira" });
+    return res.json({ ok: true, data: { ...data, parcelas: parcelasDepois } });
+  } catch (err) {
+    console.error("PUT /financeiro/compras/:id exception:", err);
+    return responderErroPublico(res, err, "Não foi possível editar a compra.");
+  }
+});
+
+app.delete("/financeiro/compras/:id", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    if (!(await exigirModuloFinanceiro(res, usuario, "financeiro_compra_editar", "excluir"))) return;
+    const id = String(req.params.id || "").trim();
+    if (!isUuid(id)) return res.status(400).json({ ok: false, error: "ID inválido" });
+    const { data: antes } = await supabaseAdmin.from("financeiro_compras").select("*").eq("id", id).maybeSingle();
+    const { error } = await supabaseAdmin.from("financeiro_compras").delete().eq("id", id);
+    if (error) throw error;
+    await registrarLog({ req, usuario, acao: "DELETE", tabela: "financeiro_compras", registro_id: id, antes, observacao: "Excluiu compra financeira" });
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("DELETE /financeiro/compras/:id exception:", err);
+    return res.status(400).json({ ok: false, error: "Não foi possível excluir a compra." });
+  }
+});
+
+app.get("/financeiro/parcelas", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    if (!(await exigirModuloFinanceiro(res, usuario, "financeiro_parcelas", "ver"))) return;
+    let query = supabaseAdmin
+      .from("financeiro_parcelas")
+      .select("*")
+      .order("vencimento", { ascending: true })
+      .limit(300);
+    const status = String(req.query?.status || "").trim().toLowerCase();
+    const inicio = String(req.query?.inicio || "").trim();
+    const fim = String(req.query?.fim || "").trim();
+    if (["aberto", "quitado", "cancelado"].includes(status)) query = query.eq("status", status);
+    if (inicio) query = query.gte("vencimento", inicio);
+    if (fim) query = query.lte("vencimento", fim);
+    const { data, error } = await query;
+    if (error) throw error;
+    return res.json({ ok: true, data: data || [] });
+  } catch (err) {
+    console.error("GET /financeiro/parcelas exception:", err);
+    return res.status(500).json({ ok: false, error: "Erro ao listar parcelas" });
+  }
+});
+
+app.put("/financeiro/parcelas/:id", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    if (!(await exigirModuloFinanceiro(res, usuario, "financeiro_parcelas", "editar"))) return;
+    const id = String(req.params.id || "").trim();
+    if (!isUuid(id)) return res.status(400).json({ ok: false, error: "ID inválido" });
+    const { data: antes } = await supabaseAdmin.from("financeiro_parcelas").select("*").eq("id", id).maybeSingle();
+    if (!antes) return res.status(404).json({ ok: false, error: "Parcela não encontrada" });
+    const payload = normalizarParcelaFinanceiraPayload(req.body);
+    const { data, error } = await supabaseAdmin.rpc(
+      "financeiro_atualizar_parcela_atomica",
+      { p_id: id, p_parcela: payload },
+    );
+    if (error) throw error;
+    await registrarLog({ req, usuario, acao: "UPDATE", tabela: "financeiro_parcelas", registro_id: id, antes, depois: data, observacao: "Editou parcela financeira" });
+    return res.json({ ok: true, data });
+  } catch (err) {
+    console.error("PUT /financeiro/parcelas/:id exception:", err);
+    return responderErroPublico(res, err, "Não foi possível editar a parcela.");
   }
 });
 
@@ -2335,6 +3181,39 @@ app.get("/funcionarios", requireAuth, async (req, res) => {
   }
 });
 
+app.get("/empreiteiros-opcoes", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    if (
+      !(await exigirAlgumaPermissao(
+        res,
+        usuario,
+        [
+          { modulo: "cad_funcionarios", acao: "criar" },
+          { modulo: "editar_funcionario", acao: "editar" },
+          { modulo: "cad_vinc_empreiteiro", acao: "ver" },
+        ],
+        "Sem permissão para consultar empreiteiros",
+      ))
+    )
+      return;
+
+    const empreiteiros = await carregarEmpreiteirosComVinculos();
+    return res.json({
+      ok: true,
+      data: empreiteiros.map(({ id, nome }) => ({ id, nome })),
+    });
+  } catch (err) {
+    console.error("GET /empreiteiros-opcoes exception:", err);
+    return responderErroPublico(
+      res,
+      err,
+      "Não foi possível carregar os empreiteiros.",
+      500,
+    );
+  }
+});
+
 app.get("/funcionarios/:id", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
@@ -2378,16 +3257,23 @@ app.get("/funcionarios/:id", requireAuth, async (req, res) => {
         .json({ ok: false, error: "Acesso não permitido a este funcionário" });
     }
 
+    const vinculo = await getVinculoFuncionario(id);
+    const funcionarioComVinculo = {
+      ...data,
+      empreiteiro_id: vinculo?.id || null,
+      empreiteiro_nome: vinculo?.nome || null,
+    };
+
     await registrarLog({
       req,
       usuario,
       acao: "VIEW",
       tabela: "cadastro_func",
-      depois: data,
+      depois: funcionarioComVinculo,
       observacao: "Visualizou funcionário",
     });
 
-    return res.json({ ok: true, data });
+    return res.json({ ok: true, data: funcionarioComVinculo });
   } catch (err) {
     console.error("GET /funcionarios/:id exception:", err);
     return res.status(500).json({ ok: false, error: "Erro interno" });
@@ -2453,6 +3339,24 @@ app.post("/funcionarios", requireAuth, async (req, res) => {
         .json({ ok: false, error: "Informe o nome do funcionário" });
     }
 
+    const empreiteiroId = req.body?.empreiteiro_id
+      ? String(req.body.empreiteiro_id).trim()
+      : null;
+    if (empreiteiroId && !isUuid(empreiteiroId)) {
+      return res.status(400).json({ ok: false, error: "Empreiteiro inválido" });
+    }
+    if (empreiteiroId && !(await getEmpreiteiroById(empreiteiroId))) {
+      return res
+        .status(404)
+        .json({ ok: false, error: "Empreiteiro não encontrado" });
+    }
+    if (empreiteiroId && !isCadastroAtivo(payload)) {
+      return res.status(400).json({
+        ok: false,
+        error: "Funcionário inativo não pode possuir vínculo com empreiteiro",
+      });
+    }
+
     const { data, error } = await supabaseAdmin
       .from("cadastro_func")
       .insert(payload)
@@ -2475,6 +3379,19 @@ app.post("/funcionarios", requireAuth, async (req, res) => {
       });
     }
 
+    try {
+      await sincronizarVinculoFuncionario(data.id, empreiteiroId);
+    } catch (vinculoError) {
+      const { error: rollbackError } = await supabaseAdmin
+        .from("cadastro_func")
+        .delete()
+        .eq("id", data.id);
+      if (rollbackError) {
+        console.error("POST /funcionarios rollback error:", rollbackError);
+      }
+      throw vinculoError;
+    }
+
     const novo = await getFuncionarioById(data.id);
 
     await registrarLog({
@@ -2484,13 +3401,21 @@ app.post("/funcionarios", requireAuth, async (req, res) => {
       tabela: "cadastro_func",
       registro_id: data.id,
       depois: novo || payload,
-      observacao: `Criou funcionário ${payload.nome}`,
+      observacao: `Criou funcionário ${payload.nome}${empreiteiroId ? " com vínculo de empreiteiro" : ""}`,
     });
 
-    return res.status(201).json({ ok: true, data });
+    return res.status(201).json({
+      ok: true,
+      data: { ...data, empreiteiro_id: empreiteiroId },
+    });
   } catch (err) {
     console.error("POST /funcionarios exception:", err);
-    return res.status(500).json({ ok: false, error: "Erro interno" });
+    return responderErroPublico(
+      res,
+      err,
+      "Não foi possível cadastrar o funcionário.",
+      500,
+    );
   }
 });
 
@@ -2521,6 +3446,11 @@ app.put("/funcionarios/:id", requireAuth, async (req, res) => {
 
     const id = req.params.id;
     const antes = await getFuncionarioById(id);
+    if (!antes) {
+      return res
+        .status(404)
+        .json({ ok: false, error: "Funcionário não encontrado" });
+    }
 
     const nome = String(req.body?.nome || "").trim();
     if (!nome) {
@@ -2559,6 +3489,33 @@ app.put("/funcionarios/:id", requireAuth, async (req, res) => {
         : null,
     };
 
+    const alterarVinculo = Object.prototype.hasOwnProperty.call(
+      req.body || {},
+      "empreiteiro_id",
+    );
+    const empreiteiroIdInformado = req.body?.empreiteiro_id
+      ? String(req.body.empreiteiro_id).trim()
+      : null;
+    if (
+      alterarVinculo &&
+      empreiteiroIdInformado &&
+      !isUuid(empreiteiroIdInformado)
+    ) {
+      return res.status(400).json({ ok: false, error: "Empreiteiro inválido" });
+    }
+    if (
+      alterarVinculo &&
+      empreiteiroIdInformado &&
+      !(await getEmpreiteiroById(empreiteiroIdInformado))
+    ) {
+      return res
+        .status(404)
+        .json({ ok: false, error: "Empreiteiro não encontrado" });
+    }
+    const empreiteiroId = isCadastroAtivo(payload)
+      ? empreiteiroIdInformado
+      : null;
+
     const { error } = await supabaseAdmin
       .from("cadastro_func")
       .update(payload)
@@ -2569,6 +3526,24 @@ app.put("/funcionarios/:id", requireAuth, async (req, res) => {
       return res
         .status(500)
         .json({ ok: false, error: "Falha ao atualizar funcionário" });
+    }
+
+    if (alterarVinculo || !isCadastroAtivo(payload)) {
+      try {
+        await sincronizarVinculoFuncionario(id, empreiteiroId);
+      } catch (vinculoError) {
+        const rollback = Object.fromEntries(
+          Object.keys(payload).map((campo) => [campo, antes[campo] ?? null]),
+        );
+        const { error: rollbackError } = await supabaseAdmin
+          .from("cadastro_func")
+          .update(rollback)
+          .eq("id", id);
+        if (rollbackError) {
+          console.error("PUT /funcionarios/:id rollback error:", rollbackError);
+        }
+        throw vinculoError;
+      }
     }
 
     const depois = await getFuncionarioById(id);
@@ -2584,10 +3559,15 @@ app.put("/funcionarios/:id", requireAuth, async (req, res) => {
       observacao: "Atualizou funcionário",
     });
 
-    return res.json({ ok: true });
+    return res.json({ ok: true, data: { empreiteiro_id: empreiteiroId } });
   } catch (err) {
     console.error("PUT /funcionarios/:id exception:", err);
-    return res.status(500).json({ ok: false, error: "Erro interno" });
+    return responderErroPublico(
+      res,
+      err,
+      "Não foi possível atualizar o funcionário.",
+      500,
+    );
   }
 });
 
@@ -2618,6 +3598,11 @@ app.patch("/funcionarios/:id", requireAuth, async (req, res) => {
 
     const id = req.params.id;
     const antes = await getFuncionarioById(id);
+    if (!antes) {
+      return res
+        .status(404)
+        .json({ ok: false, error: "Funcionário não encontrado" });
+    }
 
     const patch = {
       ...(req.body?.nome !== undefined
@@ -2694,6 +3679,24 @@ app.patch("/funcionarios/:id", requireAuth, async (req, res) => {
         .json({ ok: false, error: "Falha ao atualizar funcionário" });
     }
 
+    if (patch.situacao && !isCadastroAtivo(patch)) {
+      try {
+        await sincronizarVinculoFuncionario(id, null);
+      } catch (vinculoError) {
+        const rollback = Object.fromEntries(
+          Object.keys(patch).map((campo) => [campo, antes[campo] ?? null]),
+        );
+        const { error: rollbackError } = await supabaseAdmin
+          .from("cadastro_func")
+          .update(rollback)
+          .eq("id", id);
+        if (rollbackError) {
+          console.error("PATCH /funcionarios/:id rollback error:", rollbackError);
+        }
+        throw vinculoError;
+      }
+    }
+
     const depois = await getFuncionarioById(id);
 
     await registrarLog({
@@ -2710,7 +3713,12 @@ app.patch("/funcionarios/:id", requireAuth, async (req, res) => {
     return res.json({ ok: true });
   } catch (err) {
     console.error("PATCH /funcionarios/:id exception:", err);
-    return res.status(500).json({ ok: false, error: "Erro interno" });
+    return responderErroPublico(
+      res,
+      err,
+      "Não foi possível atualizar o funcionário.",
+      500,
+    );
   }
 });
 
@@ -2741,6 +3749,14 @@ app.delete("/funcionarios/:id", requireAuth, async (req, res) => {
 
     const id = req.params.id;
     const antes = await getFuncionarioById(id);
+    if (!antes) {
+      return res
+        .status(404)
+        .json({ ok: false, error: "Funcionário não encontrado" });
+    }
+
+    const vinculoAntes = await getVinculoFuncionario(id);
+    await sincronizarVinculoFuncionario(id, null);
 
     const { error } = await supabaseAdmin
       .from("cadastro_func")
@@ -2749,6 +3765,13 @@ app.delete("/funcionarios/:id", requireAuth, async (req, res) => {
 
     if (error) {
       console.error("DELETE /funcionarios/:id error:", error);
+      if (vinculoAntes?.id) {
+        try {
+          await sincronizarVinculoFuncionario(id, vinculoAntes.id);
+        } catch (rollbackError) {
+          console.error("DELETE /funcionarios/:id rollback error:", rollbackError);
+        }
+      }
       return res
         .status(500)
         .json({ ok: false, error: "Falha ao deletar funcionário" });
@@ -2768,7 +3791,12 @@ app.delete("/funcionarios/:id", requireAuth, async (req, res) => {
     return res.json({ ok: true });
   } catch (err) {
     console.error("DELETE /funcionarios/:id exception:", err);
-    return res.status(500).json({ ok: false, error: "Erro interno" });
+    return responderErroPublico(
+      res,
+      err,
+      "Não foi possível excluir o funcionário.",
+      500,
+    );
   }
 });
 
@@ -3196,7 +4224,7 @@ app.post("/empreiteiros", requireAuth, async (req, res) => {
     const nome = limitarTexto(req.body?.nome, 150);
     const funcionarios_ids_raw = Array.isArray(req.body?.funcionarios_ids)
       ? req.body.funcionarios_ids
-      : null;
+      : [];
 
     if (!nome) {
       return res.status(400).json({
@@ -3205,58 +4233,14 @@ app.post("/empreiteiros", requireAuth, async (req, res) => {
       });
     }
 
-    if (!funcionarios_ids_raw || funcionarios_ids_raw.length === 0) {
-      return res.status(400).json({
-        ok: false,
-        error: "Informe ao menos um funcionário",
-      });
-    }
-
-    const funcionarios_ids = [
-      ...new Set(
-        funcionarios_ids_raw
-          .map((id) => String(id || "").trim())
-          .filter(Boolean),
-      ),
-    ];
-
-    for (const funcionarioId of funcionarios_ids) {
-      if (!isUuid(funcionarioId)) {
-        return res.status(400).json({
-          ok: false,
-          error: `funcionario_id inválido: ${funcionarioId}`,
-        });
-      }
-    }
-
-    const { data: funcionarios, error: funcErr } = await supabaseAdmin
-      .from("cadastro_func")
-      .select("id, nome, funcao, situacao")
-      .in("id", funcionarios_ids);
-
-    if (funcErr) {
-      console.error("POST /empreiteiros validate funcionarios error:", funcErr);
-      return res.status(500).json({
-        ok: false,
-        error: "Falha ao validar funcionários",
-      });
-    }
-
-    const funcionariosValidos = (funcionarios || []).filter((f) =>
-      podeVerFuncionario(usuario, f),
+    const funcionarios_ids = await validarFuncionariosParaVinculo(
+      usuario,
+      funcionarios_ids_raw,
     );
-
-    if (funcionariosValidos.length !== funcionarios_ids.length) {
-      return res.status(400).json({
-        ok: false,
-        error:
-          "Um ou mais funcionários informados não existem ou não podem ser vinculados",
-      });
-    }
 
     const payload = {
       nome: String(nome).trim().toUpperCase(),
-      funcionarios_ids,
+      funcionarios_ids: [],
     };
 
     const { data, error } = await supabaseAdmin
@@ -3271,6 +4255,23 @@ app.post("/empreiteiros", requireAuth, async (req, res) => {
         ok: false,
         error: "Erro ao salvar empreiteiro",
       });
+    }
+
+    try {
+      await atualizarEmpreiteiroComVinculos(
+        data.id,
+        payload.nome,
+        funcionarios_ids,
+      );
+    } catch (vinculoError) {
+      const { error: rollbackError } = await supabaseAdmin
+        .from("cadastro_empreiteiro")
+        .delete()
+        .eq("id", data.id);
+      if (rollbackError) {
+        console.error("POST /empreiteiros rollback error:", rollbackError);
+      }
+      throw vinculoError;
     }
 
     const depois = await getEmpreiteiroById(data.id);
@@ -3288,7 +4289,12 @@ app.post("/empreiteiros", requireAuth, async (req, res) => {
     return res.status(201).json({ ok: true, data });
   } catch (err) {
     console.error("POST /empreiteiros exception:", err);
-    return res.status(500).json({ ok: false, error: "Erro interno" });
+    return responderErroPublico(
+      res,
+      err,
+      "Não foi possível salvar o empreiteiro.",
+      500,
+    );
   }
 });
 app.put("/empreiteiros/:id", requireAuth, async (req, res) => {
@@ -3342,101 +4348,21 @@ app.put("/empreiteiros/:id", requireAuth, async (req, res) => {
       ? req.body.funcionarios_ids
       : [];
 
-    const funcionarios_ids = [
-      ...new Set(
-        funcionarios_ids_raw
-          .map((funcionarioId) => String(funcionarioId || "").trim())
-          .filter(Boolean),
-      ),
-    ];
-
-    // Se removeu todos os funcionários, exclui o empreiteiro do banco.
-    if (funcionarios_ids.length === 0) {
-      const { error: delErr } = await supabaseAdmin
-        .from("cadastro_empreiteiro")
-        .delete()
-        .eq("id", id);
-
-      if (delErr) {
-        console.error("PUT /empreiteiros/:id delete vazio error:", delErr);
-        return res.status(500).json({
-          ok: false,
-          error: "Erro ao excluir empreiteiro sem funcionários",
-        });
-      }
-
-      await registrarLog({
-        req,
-        usuario,
-        acao: "DELETE",
-        tabela: "cadastro_empreiteiro",
-        registro_id: id,
-        antes,
-        depois: null,
-        observacao: `Excluiu empreiteiro ${antes.nome} porque ficou sem funcionários vinculados`,
-      });
-
-      return res.json({
-        ok: true,
-        deleted: true,
-        message: "Empreiteiro excluído porque não possui mais funcionários.",
-      });
-    }
-
-    for (const funcionarioId of funcionarios_ids) {
-      if (!isUuid(funcionarioId)) {
-        return res.status(400).json({
-          ok: false,
-          error: `funcionario_id inválido: ${funcionarioId}`,
-        });
-      }
-    }
-
-    const { data: funcionarios, error: funcErr } = await supabaseAdmin
-      .from("cadastro_func")
-      .select("id, nome, funcao, situacao")
-      .in("id", funcionarios_ids);
-
-    if (funcErr) {
-      console.error(
-        "PUT /empreiteiros/:id validate funcionarios error:",
-        funcErr,
-      );
-      return res.status(500).json({
-        ok: false,
-        error: "Falha ao validar funcionários",
-      });
-    }
-
-    const funcionariosValidos = (funcionarios || []).filter((f) =>
-      podeVerFuncionario(usuario, f),
+    const funcionarios_ids = await validarFuncionariosParaVinculo(
+      usuario,
+      funcionarios_ids_raw,
     );
-
-    if (funcionariosValidos.length !== funcionarios_ids.length) {
-      return res.status(400).json({
-        ok: false,
-        error:
-          "Um ou mais funcionários informados não existem ou não podem ser vinculados",
-      });
-    }
 
     const payload = {
       nome: String(nome).trim().toUpperCase(),
       funcionarios_ids,
     };
 
-    const { error } = await supabaseAdmin
-      .from("cadastro_empreiteiro")
-      .update(payload)
-      .eq("id", id);
-
-    if (error) {
-      console.error("PUT /empreiteiros/:id error:", error);
-      return res.status(500).json({
-        ok: false,
-        error: "Erro ao atualizar empreiteiro",
-      });
-    }
+    await atualizarEmpreiteiroComVinculos(
+      id,
+      payload.nome,
+      payload.funcionarios_ids,
+    );
 
     const depois = await getEmpreiteiroById(id);
 
@@ -3454,7 +4380,68 @@ app.put("/empreiteiros/:id", requireAuth, async (req, res) => {
     return res.json({ ok: true, data: { id } });
   } catch (err) {
     console.error("PUT /empreiteiros/:id exception:", err);
-    return res.status(500).json({ ok: false, error: "Erro interno" });
+    return responderErroPublico(
+      res,
+      err,
+      "Não foi possível atualizar o empreiteiro.",
+      500,
+    );
+  }
+});
+
+app.delete("/empreiteiros/:id", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    const id = String(req.params.id || "").trim();
+
+    if (
+      !(await exigirPermissao(
+        res,
+        usuario,
+        "cad_vinc_empreiteiro",
+        "excluir",
+        "Sem permissão para excluir empreiteiro",
+      ))
+    )
+      return;
+
+    if (!isUuid(id)) {
+      return res.status(400).json({ ok: false, error: "Empreiteiro inválido" });
+    }
+
+    const antes = await getEmpreiteiroById(id);
+    if (!antes) {
+      return res
+        .status(404)
+        .json({ ok: false, error: "Empreiteiro não encontrado" });
+    }
+
+    const { error } = await supabaseAdmin
+      .from("cadastro_empreiteiro")
+      .delete()
+      .eq("id", id);
+    if (error) throw error;
+
+    await registrarLog({
+      req,
+      usuario,
+      acao: "DELETE",
+      tabela: "cadastro_empreiteiro",
+      registro_id: id,
+      antes,
+      depois: null,
+      observacao: `Excluiu empreiteiro ${antes.nome}`,
+    });
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("DELETE /empreiteiros/:id exception:", err);
+    return responderErroPublico(
+      res,
+      err,
+      "Não foi possível excluir o empreiteiro.",
+      500,
+    );
   }
 });
 
@@ -3565,8 +4552,8 @@ app.post("/lanc-diarias", requireAuth, async (req, res) => {
       const data = String(r.data || "").trim();
 
       if (!isUuid(obra_id) || !isUuid(funcionario_id) || !data) {
-        throw new Error(
-          "Registro inválido: obra_id/funcionario_id(UUID) e data são obrigatórios.",
+        throw criarErroPublico(
+          "Informe obra, funcionário e data corretamente.",
         );
       }
 
@@ -3574,17 +4561,17 @@ app.post("/lanc-diarias", requireAuth, async (req, res) => {
       const vda = Number(r.valor_diaria_aplicado);
 
       if (!Number.isFinite(qtd)) {
-        throw new Error("qtd inválido.");
+        throw criarErroPublico("Quantidade de diária inválida.");
       }
 
       // NOVA REGRA:
       // cada lançamento individual só pode ir de 0,0 até 1,0
       if (qtd < 0 || qtd > 1) {
-        throw new Error("A diária precisa estar entre 0,0 e 1,0.");
+        throw criarErroPublico("A diária precisa estar entre 0,0 e 1,0.");
       }
 
       if (!Number.isFinite(vda) || vda <= 0) {
-        throw new Error("valor_diaria_aplicado inválido.");
+        throw criarErroPublico("Valor da diária inválido.");
       }
 
       return {
@@ -3597,6 +4584,10 @@ app.post("/lanc-diarias", requireAuth, async (req, res) => {
     });
 
     const obraIds = [...new Set(normalized.map((r) => r.obra_id))];
+    const funcIds = [...new Set(normalized.map((r) => r.funcionario_id))];
+
+    await validarObrasAtivas(obraIds);
+    await validarFuncionariosAtivos(funcIds);
 
     for (const obraId of obraIds) {
       const pode = await usuarioPodeAcessarObra(usuario, obraId);
@@ -3612,7 +4603,6 @@ app.post("/lanc-diarias", requireAuth, async (req, res) => {
     // todas as obras no mesmo dia.
     // ==================================================
 
-    const funcIds = [...new Set(normalized.map((r) => r.funcionario_id))];
     const datas = [...new Set(normalized.map((r) => r.data))];
 
     const { data: existentes, error: errExistentes } = await supabaseAdmin
@@ -3764,9 +4754,11 @@ app.post("/lanc-diarias", requireAuth, async (req, res) => {
     return res.json({ ok: true });
   } catch (e) {
     console.error("POST /lanc-diarias exception:", e);
-    return res
-      .status(400)
-      .json({ ok: false, error: e.message || "Erro ao processar diárias" });
+    return responderErroPublico(
+      res,
+      e,
+      "Não foi possível salvar as diárias.",
+    );
   }
 });
 
@@ -3877,8 +4869,8 @@ app.post("/diarias-ajustes", requireAuth, async (req, res) => {
       const data_inicio = String(a.data_inicio || "").trim();
 
       if (!isUuid(obra_id) || !isUuid(funcionario_id) || !data_inicio) {
-        throw new Error(
-          "Ajuste inválido: obra_id/funcionario_id(UUID) e data_inicio são obrigatórios.",
+        throw criarErroPublico(
+          "Informe obra, funcionário e data do ajuste corretamente.",
         );
       }
 
@@ -3889,14 +4881,14 @@ app.post("/diarias-ajustes", requireAuth, async (req, res) => {
           : Number(a.adiantamento_centavos ?? 0);
 
       if (!Number.isFinite(reembolso_centavos) || reembolso_centavos < 0) {
-        throw new Error("reembolso_centavos inválido.");
+        throw criarErroPublico("Valor de reembolso inválido.");
       }
 
       if (
         adiantamento_centavos !== null &&
         (!Number.isFinite(adiantamento_centavos) || adiantamento_centavos < 0)
       ) {
-        throw new Error("adiantamento_centavos inválido.");
+        throw criarErroPublico("Valor de adiantamento inválido.");
       }
 
       const reembolso = reembolso_centavos / 100;
@@ -3905,7 +4897,7 @@ app.post("/diarias-ajustes", requireAuth, async (req, res) => {
 
       const valor = Number(a.valor ?? 0);
       if (!Number.isFinite(valor) || valor < 0) {
-        throw new Error("valor (diária) inválido.");
+        throw criarErroPublico("Valor da diária inválido.");
       }
 
       const observacao =
@@ -3925,6 +4917,11 @@ app.post("/diarias-ajustes", requireAuth, async (req, res) => {
     });
 
     const obraIds = [...new Set(normalized.map((a) => a.obra_id))];
+    const funcIds = [...new Set(normalized.map((a) => a.funcionario_id))];
+
+    await validarObrasAtivas(obraIds);
+    await validarFuncionariosAtivos(funcIds);
+
     for (const obraId of obraIds) {
       const pode = await usuarioPodeAcessarObra(usuario, obraId);
       if (!pode) {
@@ -3934,7 +4931,6 @@ app.post("/diarias-ajustes", requireAuth, async (req, res) => {
 
     if (normalized.some((a) => a.adiantamento === null)) {
       const datas = [...new Set(normalized.map((a) => a.data_inicio))];
-      const funcIds = [...new Set(normalized.map((a) => a.funcionario_id))];
       const { data: existentes, error: errExistentes } = await supabaseAdmin
         .from("lanc_diarias_ajustes")
         .select("obra_id, funcionario_id, data_inicio, adiantamento")
@@ -3975,7 +4971,10 @@ app.post("/diarias-ajustes", requireAuth, async (req, res) => {
       console.error("POST /diarias-ajustes error:", error);
       return res
         .status(500)
-        .json({ ok: false, error: error.message || "Erro ao salvar ajustes" });
+        .json({
+          ok: false,
+          error: "Erro interno. Tente novamente em instantes.",
+        });
     }
 
     await registrarLog({
@@ -3990,9 +4989,11 @@ app.post("/diarias-ajustes", requireAuth, async (req, res) => {
     return res.json({ ok: true });
   } catch (e) {
     console.error("POST /diarias-ajustes exception:", e);
-    return res
-      .status(400)
-      .json({ ok: false, error: e.message || "Erro ao processar ajustes" });
+    return responderErroPublico(
+      res,
+      e,
+      "Não foi possível salvar os ajustes.",
+    );
   }
 });
 
@@ -4025,13 +5026,13 @@ function normalizarAdiantamentoPayload(body) {
     !isUuid(quinzena_id) ||
     !data_adiantamento
   ) {
-    throw new Error(
+    throw criarErroPublico(
       "Informe funcionário, obra e data do adiantamento corretamente.",
     );
   }
 
   if (!Number.isFinite(valor_centavos) || valor_centavos <= 0) {
-    throw new Error("Informe um valor de adiantamento maior que zero.");
+    throw criarErroPublico("Informe um valor de adiantamento maior que zero.");
   }
 
   return {
@@ -4214,6 +5215,9 @@ app.post("/adiantamentos", requireAuth, async (req, res) => {
     }
 
     const payload = normalizarAdiantamentoPayload(req.body);
+    await validarObrasAtivas([payload.obra_id]);
+    await validarFuncionariosAtivos([payload.funcionario_id]);
+
     const pode = await usuarioPodeAcessarObra(usuario, payload.obra_id);
     if (!pode) return deny(res, "Você não pode lançar nesta obra");
 
@@ -4233,9 +5237,11 @@ app.post("/adiantamentos", requireAuth, async (req, res) => {
     return res.json({ ok: true, data: salvo.depois });
   } catch (e) {
     console.error("POST /adiantamentos exception:", e);
-    return res
-      .status(400)
-      .json({ ok: false, error: e.message || "Erro ao salvar adiantamento" });
+    return responderErroPublico(
+      res,
+      e,
+      "Não foi possível salvar o adiantamento.",
+    );
   }
 });
 
@@ -4267,6 +5273,8 @@ app.put("/adiantamentos", requireAuth, async (req, res) => {
     const payload = normalizarAdiantamentoPayload(
       req.body?.adiantamento || req.body,
     );
+    await validarObrasAtivas([payload.obra_id]);
+    await validarFuncionariosAtivos([payload.funcionario_id]);
 
     const podeOriginal = await usuarioPodeAcessarObra(
       usuario,
@@ -4324,9 +5332,11 @@ app.put("/adiantamentos", requireAuth, async (req, res) => {
     return res.json({ ok: true, data: salvo.depois });
   } catch (e) {
     console.error("PUT /adiantamentos exception:", e);
-    return res
-      .status(400)
-      .json({ ok: false, error: e.message || "Erro ao editar adiantamento" });
+    return responderErroPublico(
+      res,
+      e,
+      "Não foi possível editar o adiantamento.",
+    );
   }
 });
 
@@ -4414,7 +5424,7 @@ app.delete("/adiantamentos", requireAuth, async (req, res) => {
     console.error("DELETE /adiantamentos exception:", e);
     return res
       .status(400)
-      .json({ ok: false, error: e.message || "Erro ao excluir adiantamento" });
+      .json({ ok: false, error: "Não foi possível excluir o adiantamento." });
   }
 });
 
@@ -4780,6 +5790,7 @@ app.post("/empreitas", requireAuth, async (req, res) => {
         .status(400)
         .json({ ok: false, error: "funcionario_id é obrigatório (UUID)" });
     }
+    await validarFuncionariosAtivos([funcionario_id]);
 
     if (!data_pagamento) {
       return res.status(400).json({
@@ -4890,6 +5901,7 @@ app.put("/empreitas/:id", requireAuth, async (req, res) => {
         .status(400)
         .json({ ok: false, error: "funcionario_id inválido (UUID)" });
     }
+    await validarFuncionariosAtivos([funcionario_id]);
 
     if (!data_pagamento) {
       return res.status(400).json({
@@ -5972,15 +6984,10 @@ app.get("/relatorios/obras", requireAuth, async (req, res) => {
   try {
     const usuario = await getUsuarioLogado(req.authUser.id);
 
-    const inicio = String(req.query?.inicio || "").trim();
-    const fim = String(req.query?.fim || "").trim();
-
-    if (!inicio || !fim) {
-      return res.status(400).json({
-        ok: false,
-        error: "Informe inicio e fim no formato YYYY-MM-DD",
-      });
-    }
+    const { inicio, fim } = validarPeriodoRelatorio(
+      req.query?.inicio,
+      req.query?.fim,
+    );
 
     if (
       !(await exigirPermissao(
@@ -6153,8 +7160,58 @@ app.get("/relatorios/obras", requireAuth, async (req, res) => {
     });
   } catch (err) {
     console.error("GET /relatorios/obras exception:", err);
-    return res.status(500).json({ ok: false, error: "Erro interno" });
+    return responderErroPublico(
+      res,
+      err,
+      "Não foi possível gerar o relatório por obras.",
+      500,
+    );
   }
+});
+
+// Respostas finais seguras para rotas e erros não tratados.
+app.use((req, res) => {
+  return res.status(404).json({
+    ok: false,
+    error: "Rota não encontrada.",
+  });
+});
+
+app.use((err, req, res, next) => {
+  console.error("Erro HTTP não tratado:", {
+    metodo: req.method,
+    rota: req.originalUrl,
+    nome: err?.name,
+    mensagem: err?.message,
+  });
+
+  if (res.headersSent) return next(err);
+
+  if (err?.code === "CORS_NOT_ALLOWED") {
+    return res.status(403).json({
+      ok: false,
+      error: "Origem não permitida.",
+    });
+  }
+
+  if (err?.type === "entity.parse.failed") {
+    return res.status(400).json({
+      ok: false,
+      error: "JSON inválido.",
+    });
+  }
+
+  if (err?.type === "entity.too.large" || err?.status === 413) {
+    return res.status(413).json({
+      ok: false,
+      error: "Os dados enviados excedem o limite permitido.",
+    });
+  }
+
+  return res.status(500).json({
+    ok: false,
+    error: "Erro interno. Tente novamente em instantes.",
+  });
 });
 
 // ==================================================
