@@ -2740,6 +2740,7 @@ app.get("/financeiro/plano-contas", requireAuth, async (req, res) => {
           { modulo: "financeiro_compra_cadastro", acao: "criar" },
           { modulo: "financeiro_compras", acao: "ver" },
           { modulo: "financeiro_compra_editar", acao: "editar" },
+          { modulo: "financeiro_relatorios", acao: "ver" },
         ],
         "Sem permissão para acessar o plano de contas",
       ))
@@ -2833,6 +2834,7 @@ app.get("/financeiro/centros-custo", requireAuth, async (req, res) => {
           { modulo: "financeiro_compra_cadastro", acao: "criar" },
           { modulo: "financeiro_compras", acao: "ver" },
           { modulo: "financeiro_compra_editar", acao: "editar" },
+          { modulo: "financeiro_relatorios", acao: "ver" },
         ],
         "Sem permissão para acessar os centros de custo",
       ))
@@ -2909,6 +2911,246 @@ app.delete("/financeiro/centros-custo/:id", requireAuth, async (req, res) => {
   } catch (err) {
     console.error("DELETE /financeiro/centros-custo/:id exception:", err);
     return res.status(400).json({ ok: false, error: "Não foi possível excluir o centro de custo." });
+  }
+});
+
+app.get("/financeiro/relatorios/custos", requireAuth, async (req, res) => {
+  try {
+    const usuario = await getUsuarioLogado(req.authUser.id);
+    if (!(await exigirModuloFinanceiro(res, usuario, "financeiro_relatorios", "ver"))) return;
+
+    const { inicio, fim } = validarPeriodoRelatorio(
+      req.query?.inicio,
+      req.query?.fim,
+    );
+    const agrupamento = String(req.query?.agrupamento || "centro")
+      .trim()
+      .toLowerCase();
+    const status = String(req.query?.status || "ativas")
+      .trim()
+      .toLowerCase();
+    const grupoId = String(req.query?.grupo_id || "").trim();
+
+    if (!['centro', 'plano'].includes(agrupamento)) {
+      throw criarErroPublico("Agrupamento financeiro inválido.");
+    }
+    if (!['ativas', 'aberto', 'quitado', 'cancelado', 'todos'].includes(status)) {
+      throw criarErroPublico("Situação financeira inválida.");
+    }
+    if (grupoId && !isUuid(grupoId)) {
+      throw criarErroPublico("Classificação financeira inválida.");
+    }
+
+    let query = supabaseAdmin
+      .from("financeiro_compras")
+      .select(
+        "id, centro_custo_id, plano_conta_id, fornecedor_id, data_compra, descricao, status, valor_total, numero_parcelas",
+      )
+      .gte("data_compra", inicio)
+      .lte("data_compra", fim)
+      .order("data_compra", { ascending: false })
+      .limit(2000);
+
+    if (status === "ativas") query = query.neq("status", "cancelado");
+    if (["aberto", "quitado", "cancelado"].includes(status)) {
+      query = query.eq("status", status);
+    }
+    if (grupoId) {
+      query = query.eq(
+        agrupamento === "centro" ? "centro_custo_id" : "plano_conta_id",
+        grupoId,
+      );
+    }
+
+    const { data: comprasBase, error: comprasError } = await query;
+    if (comprasError) throw comprasError;
+
+    const compras = await carregarComprasComParcelas(comprasBase || []);
+    const idsGrupos = [
+      ...new Set(
+        compras
+          .map((compra) =>
+            agrupamento === "centro"
+              ? compra.centro_custo_id
+              : compra.plano_conta_id,
+          )
+          .filter(Boolean),
+      ),
+    ];
+    const idsFornecedores = [
+      ...new Set(compras.map((compra) => compra.fornecedor_id).filter(Boolean)),
+    ];
+
+    let cadastrosGrupo = [];
+    if (idsGrupos.length) {
+      const tabelaGrupo =
+        agrupamento === "centro"
+          ? "financeiro_centros_custo"
+          : "financeiro_planos_contas";
+      const { data, error } = await supabaseAdmin
+        .from(tabelaGrupo)
+        .select(agrupamento === "centro" ? "id, nome, tipo" : "id, nome, codigo")
+        .in("id", idsGrupos);
+      if (error) throw error;
+      cadastrosGrupo = data || [];
+    }
+
+    let fornecedores = [];
+    if (idsFornecedores.length) {
+      const { data, error } = await supabaseAdmin
+        .from("financeiro_fornecedores")
+        .select("id, nome")
+        .in("id", idsFornecedores);
+      if (error) throw error;
+      fornecedores = data || [];
+    }
+
+    const nomesGrupo = new Map(
+      cadastrosGrupo.map((item) => [String(item.id), item]),
+    );
+    const nomesFornecedores = new Map(
+      fornecedores.map((item) => [String(item.id), item.nome]),
+    );
+    const arredondar = (valor) => Math.round(Number(valor || 0) * 100) / 100;
+    const gruposMap = new Map();
+
+    const resumo = {
+      quantidade_compras: 0,
+      total_ativo: 0,
+      total_pago: 0,
+      total_pendente: 0,
+      total_cancelado: 0,
+    };
+
+    for (const compra of compras) {
+      const grupoId = String(
+        agrupamento === "centro"
+          ? compra.centro_custo_id || "sem-centro"
+          : compra.plano_conta_id || "sem-plano",
+      );
+      const cadastroGrupo = nomesGrupo.get(grupoId);
+      const cancelada = String(compra.status || "").toLowerCase() === "cancelado";
+      const parcelas = Array.isArray(compra.parcelas) ? compra.parcelas : [];
+      const totalPago = arredondar(
+        parcelas
+          .filter((parcela) => parcela.status === "quitado")
+          .reduce((total, parcela) => total + Number(parcela.valor || 0), 0),
+      );
+      const totalPendente = cancelada
+        ? 0
+        : arredondar(
+            parcelas
+              .filter((parcela) => parcela.status === "aberto")
+              .reduce((total, parcela) => total + Number(parcela.valor || 0), 0),
+          );
+      const comprovantes = [
+        ...new Set(
+          parcelas
+            .map((parcela) => limitarTexto(parcela.comprovante_url, 1000))
+            .filter(Boolean),
+        ),
+      ];
+      const notasFiscais = [
+        ...new Set(
+          parcelas
+            .map((parcela) => limitarTexto(parcela.nota_fiscal_url, 1000))
+            .filter(Boolean),
+        ),
+      ];
+      const valorCompra = arredondar(compra.valor_total);
+
+      if (!gruposMap.has(grupoId)) {
+        gruposMap.set(grupoId, {
+          id: grupoId,
+          nome: cadastroGrupo?.nome || "SEM CLASSIFICAÇÃO",
+          complemento:
+            agrupamento === "centro"
+              ? cadastroGrupo?.tipo || null
+              : cadastroGrupo?.codigo || null,
+          quantidade_compras: 0,
+          total_ativo: 0,
+          total_pago: 0,
+          total_pendente: 0,
+          total_cancelado: 0,
+          compras: [],
+        });
+      }
+
+      const grupo = gruposMap.get(grupoId);
+      grupo.quantidade_compras += 1;
+      grupo.total_ativo += cancelada ? 0 : valorCompra;
+      grupo.total_pago += totalPago;
+      grupo.total_pendente += totalPendente;
+      grupo.total_cancelado += cancelada ? valorCompra : 0;
+      grupo.compras.push({
+        id: compra.id,
+        data_compra: compra.data_compra,
+        descricao: compra.descricao,
+        fornecedor: nomesFornecedores.get(String(compra.fornecedor_id)) || "-",
+        status: compra.status,
+        valor_total: valorCompra,
+        total_pago: totalPago,
+        total_pendente: totalPendente,
+        comprovantes,
+        notas_fiscais: notasFiscais,
+      });
+
+      resumo.quantidade_compras += 1;
+      resumo.total_ativo += cancelada ? 0 : valorCompra;
+      resumo.total_pago += totalPago;
+      resumo.total_pendente += totalPendente;
+      resumo.total_cancelado += cancelada ? valorCompra : 0;
+    }
+
+    for (const campo of [
+      "total_ativo",
+      "total_pago",
+      "total_pendente",
+      "total_cancelado",
+    ]) {
+      resumo[campo] = arredondar(resumo[campo]);
+    }
+
+    const grupos = [...gruposMap.values()]
+      .map((grupo) => ({
+        ...grupo,
+        total_ativo: arredondar(grupo.total_ativo),
+        total_pago: arredondar(grupo.total_pago),
+        total_pendente: arredondar(grupo.total_pendente),
+        total_cancelado: arredondar(grupo.total_cancelado),
+      }))
+      .sort((a, b) => b.total_ativo - a.total_ativo || a.nome.localeCompare(b.nome));
+
+    await registrarLog({
+      req,
+      usuario,
+      acao: "VIEW",
+      tabela: "financeiro_relatorio_custos",
+      depois: {
+        inicio,
+        fim,
+        agrupamento,
+        status,
+        grupo_id: grupoId || null,
+        quantidade_compras: resumo.quantidade_compras,
+      },
+      observacao: "Consultou relatório financeiro por classificação",
+    });
+
+    return res.json({
+      ok: true,
+      filtros: { inicio, fim, agrupamento, status, grupo_id: grupoId || null },
+      resumo,
+      grupos,
+    });
+  } catch (err) {
+    console.error("GET /financeiro/relatorios/custos exception:", err);
+    return responderErroPublico(
+      res,
+      err,
+      "Não foi possível gerar o relatório financeiro.",
+      500,
+    );
   }
 });
 
